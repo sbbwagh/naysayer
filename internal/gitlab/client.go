@@ -737,6 +737,86 @@ func (c *Client) ListOpenMRsWithDetails(projectID int) ([]MRDetails, error) {
 	return detailedMRs, nil
 }
 
+// ListAllOpenMRsWithDetails lists all open merge requests for a project (no date filter)
+// This is used by the stale MR cleanup feature to find MRs that are 27-30+ days old
+func (c *Client) ListAllOpenMRsWithDetails(projectID int) ([]MRDetails, error) {
+	var allMRs []MRDetails
+	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests?state=opened&per_page=100",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID)
+
+	for url != "" {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create list MRs request: %w", err)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+c.config.Token)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list MRs: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("list MRs failed with status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var mrs []MRDetails
+		err = json.NewDecoder(resp.Body).Decode(&mrs)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode MRs response: %w", err)
+		}
+
+		allMRs = append(allMRs, mrs...)
+
+		// Get next page URL from Link header using parseNextLink helper
+		url = parseNextLink(resp.Header.Get("Link"))
+	}
+
+	return allMRs, nil
+}
+
+// CloseMR closes a merge request
+func (c *Client) CloseMR(projectID, mrIID int) error {
+	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, mrIID)
+
+	payload := map[string]string{
+		"state_event": "close",
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal close MR payload: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create close MR request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to close MR: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("close MR failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	logging.Info("Successfully closed MR !%d in project %d", mrIID, projectID)
+	return nil
+}
+
 // GetPipelineJobs retrieves all jobs for a pipeline
 func (c *Client) GetPipelineJobs(projectID, pipelineID int) ([]PipelineJob, error) {
 	url := fmt.Sprintf("%s/api/v4/projects/%d/pipelines/%d/jobs",
