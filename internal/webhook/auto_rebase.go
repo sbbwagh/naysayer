@@ -212,26 +212,46 @@ func (h *AutoRebaseHandler) handlePushToMain(c *fiber.Ctx, payload map[string]in
 	failures := make([]map[string]interface{}, 0)
 
 	for _, mr := range eligibleMRs {
-		logging.Info("Attempting to rebase MR", zap.Int("mr_iid", mr.IID), zap.Int("behind_commits", mr.BehindCommitsCount))
-
-		// Pre-check: Skip if already up-to-date
-		if mr.BehindCommitsCount == 0 {
-			logging.Info("MR is already up-to-date, skipping rebase", zap.Int("mr_iid", mr.IID))
-			continue
-		}
-
-		// Pre-check: Skip if has conflicts
-		if mr.HasConflicts || mr.MergeStatus == "cannot_be_merged" {
-			logging.Warn("MR has conflicts, skipping rebase",
+		// Use GitLab Compare API to authoritatively determine if MR is behind
+		// MR fields (behind_commits_count, diverged_commits_count, merge_status) are unreliable
+		// as they can be null, stale, or blocked by approval rules
+		compareResult, err := h.gitlabClient.CompareBranches(projectID, mr.SourceBranch, mr.TargetBranch)
+		if err != nil {
+			logging.Warn("Failed to compare branches for MR, skipping rebase",
 				zap.Int("mr_iid", mr.IID),
-				zap.String("merge_status", mr.MergeStatus))
+				zap.String("source_branch", mr.SourceBranch),
+				zap.String("target_branch", mr.TargetBranch),
+				zap.Error(err))
 			failureCount++
 			failures = append(failures, map[string]interface{}{
 				"mr_iid": mr.IID,
-				"error":  fmt.Sprintf("rebase skipped: MR has merge conflicts (merge_status: %s)", mr.MergeStatus),
+				"error":  fmt.Sprintf("failed to compare branches: %v", err),
 			})
 			continue
 		}
+
+		behindByCompare := len(compareResult.Commits)
+		logging.Info("Evaluating MR for rebase",
+			zap.Int("mr_iid", mr.IID),
+			zap.String("source_branch", mr.SourceBranch),
+			zap.String("target_branch", mr.TargetBranch),
+			zap.Int("behind_by_compare", behindByCompare))
+
+		// AUTHORITATIVE CHECK: Use Compare API result to determine if rebase is needed
+		// If behind_by_compare == 0, source branch already contains all target branch commits
+		if behindByCompare == 0 {
+			logging.Info("Skipping rebase: source branch already contains target branch commits",
+				zap.Int("mr_iid", mr.IID),
+				zap.String("source_branch", mr.SourceBranch),
+				zap.String("target_branch", mr.TargetBranch))
+			continue
+		}
+
+		logging.Info("Rebase required: target branch has commits missing in source branch",
+			zap.Int("mr_iid", mr.IID),
+			zap.Int("behind_by_compare", behindByCompare),
+			zap.String("source_branch", mr.SourceBranch),
+			zap.String("target_branch", mr.TargetBranch))
 
 		success, actuallyRebased, err := h.gitlabClient.RebaseMR(projectID, mr.IID)
 		if err != nil {

@@ -29,6 +29,7 @@ type GitLabClient interface {
 
 	// Rebase operations
 	RebaseMR(projectID, mrIID int) (bool, bool, error) // Returns (success, actuallyRebased, error)
+	CompareBranches(projectID int, sourceBranch, targetBranch string) (*CompareResult, error)
 	ListOpenMRs(projectID int) ([]int, error)
 	ListOpenMRsWithDetails(projectID int) ([]MRDetails, error)
 

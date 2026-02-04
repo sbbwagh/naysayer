@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -639,16 +640,9 @@ func (c *Client) RebaseMR(projectID, mrIID int) (bool, bool, error) {
 		return false, false, fmt.Errorf("rebase already in progress for MR %d", mrIID)
 	}
 
-	// Check if MR has conflicts
-	if mrDetails.HasConflicts || mrDetails.MergeStatus == "cannot_be_merged" {
-		return false, false, fmt.Errorf("rebase failed: MR has merge conflicts (merge_status: %s)", mrDetails.MergeStatus)
-	}
-
-	// Check if rebase is needed
-	if mrDetails.BehindCommitsCount == 0 {
-		// Already up-to-date, no rebase needed
-		return true, false, nil
-	}
+	// Note: We no longer check MR fields like has_conflicts, merge_status, behind_commits_count, 
+	// or diverged_commits_count here as they are unreliable (can be null, stale, or blocked by approvals).
+	// The caller should use CompareBranches() to authoritatively determine if rebase is needed.
 
 	// Step 2: Trigger rebase
 	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/rebase",
@@ -695,6 +689,45 @@ func (c *Client) RebaseMR(projectID, mrIID int) (bool, bool, error) {
 	}
 }
 
+// CompareBranches compares two branches using GitLab Compare API
+// Returns the number of commits that targetBranch has that sourceBranch doesn't have
+// This is the AUTHORITATIVE way to determine if an MR needs rebasing
+// Direction: from=sourceBranch, to=targetBranch
+func (c *Client) CompareBranches(projectID int, sourceBranch, targetBranch string) (*CompareResult, error) {
+	// URL encode branch names to handle special characters
+	encodedSource := url.QueryEscape(sourceBranch)
+	encodedTarget := url.QueryEscape(targetBranch)
+
+	url := fmt.Sprintf("%s/api/v4/projects/%d/repository/compare?from=%s&to=%s",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, encodedSource, encodedTarget)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create compare branches request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compare branches: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("compare branches failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result CompareResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode compare result: %w", err)
+	}
+
+	return &result, nil
+}
+
 // verifyRebaseCompleted polls the MR to verify rebase completed successfully
 // Returns (actuallyRebased bool, error)
 func (c *Client) verifyRebaseCompleted(projectID, mrIID int) (bool, error) {
@@ -725,21 +758,16 @@ func (c *Client) verifyRebaseCompleted(projectID, mrIID int) (bool, error) {
 			return false, fmt.Errorf("rebase completed but conflicts were introduced (merge_status: %s)", mrDetails.MergeStatus)
 		}
 
-		// Check if rebase actually happened (commits were added)
-		// If behind_commits_count decreased or is now 0, rebase succeeded
-		if mrDetails.BehindCommitsCount == 0 {
-			// Successfully rebased and up-to-date
-			return true, nil
-		}
+		// Rebase completed successfully
+		// Note: We no longer rely on behind_commits_count or diverged_commits_count as they are unreliable.
+		// The fact that rebase completed without conflicts is sufficient verification.
+		logging.Info("Rebase completed successfully for MR %d", mrIID)
+		return true, nil
 
-		// If we've waited long enough and rebase is not in progress but behind_commits_count
-		// hasn't changed, something went wrong
-		if attempt >= maxAttempts-1 {
-			return false, fmt.Errorf("rebase verification timeout: rebase completed but MR still behind (behind_commits_count: %d)", mrDetails.BehindCommitsCount)
-		}
 	}
 
-	return false, fmt.Errorf("rebase verification timeout: rebase still in progress after %d attempts", maxAttempts)
+	// Timeout reached - rebase still in progress or verification incomplete
+	return false, fmt.Errorf("rebase verification timeout: max %d seconds exceeded", maxAttempts*int(delay.Seconds()))
 }
 
 // ListOpenMRs returns a list of open MR IIDs for a project
@@ -966,86 +994,6 @@ func (c *Client) GetJobTrace(projectID, jobID int) (string, error) {
 	}
 
 	return trace.Content, nil
-}
-
-// ListAllOpenMRsWithDetails lists all open merge requests for a project (no date filter)
-// This is used by the stale MR cleanup feature to find MRs that are 27-30+ days old
-func (c *Client) ListAllOpenMRsWithDetails(projectID int) ([]MRDetails, error) {
-	var allMRs []MRDetails
-	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests?state=opened&per_page=100",
-		strings.TrimRight(c.config.BaseURL, "/"), projectID)
-
-	for url != "" {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create list MRs request: %w", err)
-		}
-
-		req.Header.Set("Authorization", "Bearer "+c.config.Token)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list MRs: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			return nil, fmt.Errorf("list MRs failed with status %d: %s", resp.StatusCode, string(body))
-		}
-
-		var mrs []MRDetails
-		err = json.NewDecoder(resp.Body).Decode(&mrs)
-		_ = resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode MRs response: %w", err)
-		}
-
-		allMRs = append(allMRs, mrs...)
-
-		// Get next page URL from Link header using parseNextLink helper
-		url = parseNextLink(resp.Header.Get("Link"))
-	}
-
-	return allMRs, nil
-}
-
-// CloseMR closes a merge request
-func (c *Client) CloseMR(projectID, mrIID int) error {
-	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d",
-		strings.TrimRight(c.config.BaseURL, "/"), projectID, mrIID)
-
-	payload := map[string]string{
-		"state_event": "close",
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal close MR payload: %w", err)
-	}
-
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return fmt.Errorf("failed to create close MR request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to close MR: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("close MR failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	logging.Info("Successfully closed MR !%d in project %d", mrIID, projectID)
-	return nil
 }
 
 // FindLatestAtlantisComment finds the latest comment from atlantis-bot

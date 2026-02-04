@@ -304,6 +304,12 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
+// CompareBranches is a no-op for mock client (compare functionality is not tested in e2e)
+func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+	// Mock: return empty result (up-to-date)
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+
 // RebaseMR is a no-op for mock client (rebase functionality is not tested in e2e)
 func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
 	// In e2e tests, we don't need to test rebase functionality

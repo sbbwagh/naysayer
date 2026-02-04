@@ -2,6 +2,37 @@
 
 Complete guide for building, testing, and validating the generic auto-rebase feature with pipeline job checking, conflict detection, and optional atlantis comment checking.
 
+## ⚠️ Important: How Behind Detection Works
+
+**Naysayer uses GitLab Compare API (not MR fields) to determine if rebase is needed:**
+
+### Why MR Fields Are Unreliable
+GitLab MR fields like `behind_commits_count`, `diverged_commits_count`, `merge_status`, and `detailed_merge_status`:
+- Can be `null` or `0` even when MR is actually behind
+- May be stale or not updated after target branch changes
+- Can be blocked/incorrect when approval rules are configured
+- Don't consistently reflect the true branch comparison state
+
+### The Authoritative Method: Compare API
+```bash
+# This is what Naysayer uses internally (and what GitLab UI uses)
+curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+```
+
+**How it works:**
+- `from=$SOURCE_BRANCH` - The MR source branch
+- `to=$TARGET_BRANCH` - The MR target branch (usually `main`)
+- `commits` array contains commits that target has but source doesn't
+- `behind_count = commits.length`
+- If `behind_count > 0` → Rebase needed
+- If `behind_count == 0` → Already up-to-date, skip rebase
+
+**Direction matters:**
+- ✅ Correct: `from=source&to=target` (commits target has that source needs)
+- ❌ Wrong: `from=target&to=source` (commits source has that target doesn't)
+
 ## 📋 Overview
 
 This guide covers end-to-end testing of the enhanced auto-rebase logic that:

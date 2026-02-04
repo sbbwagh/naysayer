@@ -503,6 +503,10 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
+func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+
 func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
 	return true, true, nil
 }

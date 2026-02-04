@@ -30,6 +30,15 @@ type MockRebaseGitLabClient struct {
 	}
 }
 
+func (m *MockRebaseGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+	// Mock: return 1 commit behind by default (needs rebase)
+	return &gitlab.CompareResult{
+		Commits: []gitlab.CompareCommit{
+			{ID: "abc123", ShortID: "abc123", Title: "Mock commit"},
+		},
+	}, nil
+}
+
 func (m *MockRebaseGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
 	m.capturedRebaseMRs = append(m.capturedRebaseMRs, struct {
 		projectID int

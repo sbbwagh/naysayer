@@ -593,8 +593,8 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
-func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) error {
-	return nil
+func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
+	return true, true, nil
 }
 
 func (m *MockGitLabClient) ListOpenMRs(projectID int) ([]int, error) {

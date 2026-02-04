@@ -132,6 +132,22 @@ type MRPipeline struct {
 	Status string `json:"status"` // running, pending, success, failed, canceled, skipped
 }
 
+// CompareResult represents the result of comparing two branches
+type CompareResult struct {
+	Commits []CompareCommit `json:"commits"`
+}
+
+// CompareCommit represents a commit in a compare result
+type CompareCommit struct {
+	ID             string `json:"id"`
+	ShortID        string `json:"short_id"`
+	Title          string `json:"title"`
+	AuthorName     string `json:"author_name"`
+	AuthorEmail    string `json:"author_email"`
+	CommittedDate  string `json:"committed_date"`
+	Message        string `json:"message"`
+}
+
 // GetMRDetails fetches merge request details
 func (c *Client) GetMRDetails(projectID, mrIID int) (*MRDetails, error) {
 	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d",
