@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 
 	"github.com/redhat-data-and-ai/naysayer/internal/config"
 	"github.com/redhat-data-and-ai/naysayer/internal/gitlab"
@@ -766,4 +768,429 @@ func TestFivetranTerraformRebaseHandler_HandleWebhook_WithFilteredMRs(t *testing
 	// Verify comment was added
 	assert.Len(t, mockClient.capturedComments, 1)
 	assert.Contains(t, mockClient.capturedComments[0], "Automated Rebase")
+}
+
+// --- Compare API tests (authoritative behind detection) ---
+
+// TestAutoRebase_CompareBranchesUsage tests that Compare API is used to determine behind status
+func TestAutoRebase_CompareBranchesUsage(t *testing.T) {
+	mockClient := &MockRebaseGitLabClient{
+		rebaseError: nil,
+		capturedRebaseMRs: make([]struct {
+			projectID int
+			mrIID     int
+		}, 0),
+		capturedComments: make([]string, 0),
+	}
+	mockClient.openMRs = []int{100, 200}
+
+	cfg := createTestConfig()
+	handler := NewAutoRebaseHandlerWithClient(cfg, mockClient)
+
+	app := fiber.New()
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{
+			"id": 123,
+		},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+
+	assert.Equal(t, 2, len(mockClient.capturedRebaseMRs), "Expected 2 MRs to be rebased")
+}
+
+// TestAutoRebase_SkipsUpToDateMR tests that MRs with 0 behind commits are skipped
+func TestAutoRebase_SkipsUpToDateMR(t *testing.T) {
+	mockClient := &MockRebaseGitLabClient{
+		rebaseError: nil,
+		capturedRebaseMRs: make([]struct {
+			projectID int
+			mrIID     int
+		}, 0),
+		capturedComments: make([]string, 0),
+	}
+	mockClient.openMRs = []int{100}
+
+	customMockClient := &CustomCompareGitLabClient{
+		MockRebaseGitLabClient: mockClient,
+		behindCommitCount:      0,
+	}
+
+	cfg := createTestConfig()
+	handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
+
+	app := fiber.New()
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{"id": 123},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 0, len(mockClient.capturedRebaseMRs), "Expected 0 MRs to be rebased (already up-to-date)")
+}
+
+// TestAutoRebase_RebasesBehindMR tests that MRs with commits behind are rebased
+func TestAutoRebase_RebasesBehindMR(t *testing.T) {
+	mockClient := &MockRebaseGitLabClient{
+		rebaseError: nil,
+		capturedRebaseMRs: make([]struct {
+			projectID int
+			mrIID     int
+		}, 0),
+		capturedComments: make([]string, 0),
+	}
+	mockClient.openMRs = []int{100}
+
+	customMockClient := &CustomCompareGitLabClient{
+		MockRebaseGitLabClient: mockClient,
+		behindCommitCount:      3,
+	}
+
+	cfg := createTestConfig()
+	handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
+
+	app := fiber.New()
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{"id": 123},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 1, len(mockClient.capturedRebaseMRs), "Expected 1 MR to be rebased")
+	assert.Equal(t, 123, mockClient.capturedRebaseMRs[0].projectID)
+	assert.Equal(t, 100, mockClient.capturedRebaseMRs[0].mrIID)
+}
+
+// TestAutoRebase_CompareAPIFailure tests handling of Compare API failures
+func TestAutoRebase_CompareAPIFailure(t *testing.T) {
+	mockClient := &MockRebaseGitLabClient{
+		rebaseError: nil,
+		capturedRebaseMRs: make([]struct {
+			projectID int
+			mrIID     int
+		}, 0),
+		capturedComments: make([]string, 0),
+	}
+	mockClient.openMRs = []int{100}
+
+	customMockClient := &CustomCompareGitLabClient{
+		MockRebaseGitLabClient: mockClient,
+		compareError:           assert.AnError,
+	}
+
+	cfg := createTestConfig()
+	handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
+
+	app := fiber.New()
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{"id": 123},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 0, len(mockClient.capturedRebaseMRs), "Expected 0 MRs to be rebased (compare failed)")
+
+	var responseBody map[string]interface{}
+	err = json.NewDecoder(resp.Body).Decode(&responseBody)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(0), responseBody["successful"])
+	assert.Equal(t, float64(1), responseBody["failed"])
+}
+
+// TestAutoRebase_LogsCompareResults tests that compare results are logged
+func TestAutoRebase_LogsCompareResults(t *testing.T) {
+	mockClient := &MockRebaseGitLabClient{
+		rebaseError: nil,
+		capturedRebaseMRs: make([]struct {
+			projectID int
+			mrIID     int
+		}, 0),
+		capturedComments: make([]string, 0),
+	}
+	mockClient.openMRs = []int{100}
+
+	customMockClient := &CustomCompareGitLabClient{
+		MockRebaseGitLabClient: mockClient,
+		behindCommitCount:      2,
+	}
+
+	cfg := createTestConfig()
+	handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
+
+	app := fiber.New()
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{"id": 123},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 1, len(mockClient.capturedRebaseMRs))
+}
+
+// CustomCompareGitLabClient wraps MockRebaseGitLabClient to customize CompareBranches behavior
+type CustomCompareGitLabClient struct {
+	*MockRebaseGitLabClient
+	behindCommitCount int
+	compareError      error
+}
+
+func (c *CustomCompareGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+	if c.compareError != nil {
+		return nil, c.compareError
+	}
+	commits := make([]gitlab.CompareCommit, c.behindCommitCount)
+	for i := 0; i < c.behindCommitCount; i++ {
+		commits[i] = gitlab.CompareCommit{
+			ID:      "commit" + string(rune('1'+i)),
+			ShortID: "commit" + string(rune('1'+i)),
+			Title:   "Test commit " + string(rune('1'+i)),
+		}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
+}
+
+// TestAutoRebase_MixedBehindStatus tests handling of mixed MR behind statuses
+func TestAutoRebase_MixedBehindStatus(t *testing.T) {
+	tests := []struct {
+		name            string
+		mrIIDs          []int
+		behindCounts    map[int]int
+		expectedRebased int
+	}{
+		{"All up-to-date", []int{100, 200, 300}, map[int]int{100: 0, 200: 0, 300: 0}, 0},
+		{"All behind", []int{100, 200, 300}, map[int]int{100: 1, 200: 2, 300: 3}, 3},
+		{"Mixed status", []int{100, 200, 300}, map[int]int{100: 0, 200: 1, 300: 0}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			multiMRCounter = 0 // reset for each subtest
+			mockClient := &MockRebaseGitLabClient{
+				rebaseError: nil,
+				capturedRebaseMRs: make([]struct {
+					projectID int
+					mrIID     int
+				}, 0),
+				capturedComments: make([]string, 0),
+			}
+			mockClient.openMRs = tt.mrIIDs
+			customMockClient := &MultiMRCompareClient{
+				MockRebaseGitLabClient: mockClient,
+				behindCounts:            tt.behindCounts,
+			}
+			cfg := createTestConfig()
+			handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
+			app := fiber.New()
+			app.Post("/auto-rebase", handler.HandleWebhook)
+			payload := map[string]interface{}{
+				"object_kind": "push",
+				"ref":         "refs/heads/main",
+				"project":     map[string]interface{}{"id": 123},
+			}
+			payloadBytes, _ := json.Marshal(payload)
+			req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req, -1)
+			assert.NoError(t, err)
+			assert.Equal(t, 200, resp.StatusCode)
+			assert.Equal(t, tt.expectedRebased, len(mockClient.capturedRebaseMRs), "Unexpected number of rebased MRs")
+		})
+	}
+}
+
+// MultiMRCompareClient supports different behind counts for different MRs
+type MultiMRCompareClient struct {
+	*MockRebaseGitLabClient
+	behindCounts map[int]int
+}
+
+var multiMRCounter int
+
+func (c *MultiMRCompareClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+	mrIID := c.openMRs[multiMRCounter%len(c.openMRs)]
+	multiMRCounter++
+	behindCount := c.behindCounts[mrIID]
+	commits := make([]gitlab.CompareCommit, behindCount)
+	for i := 0; i < behindCount; i++ {
+		commits[i] = gitlab.CompareCommit{
+			ID:      "commit" + strings.Repeat(string(rune('a'+i)), 7),
+			ShortID: "commit" + string(rune('a'+i)),
+			Title:   "Test commit",
+		}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
+}
+
+func (c *MultiMRCompareClient) GetMRDetails(projectID, mrIID int) (*gitlab.MRDetails, error) {
+	return &gitlab.MRDetails{
+		IID:                mrIID,
+		SourceBranch:       "feature-branch-" + strings.Repeat(string(rune('0'+mrIID)), 1),
+		TargetBranch:       "main",
+		CreatedAt:          time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+		Pipeline:           &gitlab.MRPipeline{Status: "success"},
+		BehindCommitsCount: 1,
+		MergeStatus:        "can_be_merged",
+		RebaseInProgress:   false,
+		HasConflicts:       false,
+	}, nil
+}
+
+func (c *MultiMRCompareClient) ListOpenMRsWithDetails(projectID int) ([]gitlab.MRDetails, error) {
+	details := make([]gitlab.MRDetails, 0)
+	for _, mrIID := range c.openMRs {
+		details = append(details, gitlab.MRDetails{
+			IID:                mrIID,
+			SourceBranch:       "feature-branch-" + strings.Repeat(string(rune('0'+mrIID)), 1),
+			TargetBranch:       "main",
+			CreatedAt:          time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+			Pipeline:           &gitlab.MRPipeline{Status: "success"},
+			BehindCommitsCount: 1,
+			MergeStatus:        "can_be_merged",
+			RebaseInProgress:   false,
+			HasConflicts:       false,
+		})
+	}
+	return details, nil
+}
+
+// TestAutoRebase_CompareBranchDirection tests that Compare API is called with correct direction
+func TestAutoRebase_CompareBranchDirection(t *testing.T) {
+	capturedComparisons := make([]struct {
+		source string
+		target string
+	}, 0)
+	mockClient := &MockRebaseGitLabClient{
+		rebaseError: nil,
+		capturedRebaseMRs: make([]struct {
+			projectID int
+			mrIID     int
+		}, 0),
+		capturedComments: make([]string, 0),
+	}
+	mockClient.openMRs = []int{100}
+	customMockClient := &DirectionTrackingClient{
+		MockRebaseGitLabClient: mockClient,
+		capturedComparisons:    &capturedComparisons,
+		behindCount:            1,
+	}
+	cfg := createTestConfig()
+	handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
+	app := fiber.New()
+	app.Post("/auto-rebase", handler.HandleWebhook)
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project":     map[string]interface{}{"id": 123},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 1, len(capturedComparisons), "Expected 1 compare call")
+	assert.Equal(t, "feature-branch", capturedComparisons[0].source, "Source should be feature branch")
+	assert.Equal(t, "main", capturedComparisons[0].target, "Target should be main branch")
+}
+
+// DirectionTrackingClient tracks Compare API call direction
+type DirectionTrackingClient struct {
+	*MockRebaseGitLabClient
+	capturedComparisons *[]struct {
+		source string
+		target string
+	}
+	behindCount int
+}
+
+func (c *DirectionTrackingClient) GetMRDetails(projectID, mrIID int) (*gitlab.MRDetails, error) {
+	return &gitlab.MRDetails{
+		IID:                mrIID,
+		SourceBranch:       "feature-branch",
+		TargetBranch:       "main",
+		CreatedAt:          time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+		Pipeline:           &gitlab.MRPipeline{Status: "success"},
+		BehindCommitsCount: 1,
+		MergeStatus:        "can_be_merged",
+		RebaseInProgress:   false,
+		HasConflicts:       false,
+	}, nil
+}
+
+func (c *DirectionTrackingClient) ListOpenMRsWithDetails(projectID int) ([]gitlab.MRDetails, error) {
+	return []gitlab.MRDetails{
+		{
+			IID:                100,
+			SourceBranch:       "feature-branch",
+			TargetBranch:       "main",
+			CreatedAt:          time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+			Pipeline:           &gitlab.MRPipeline{Status: "success"},
+			BehindCommitsCount: 1,
+			MergeStatus:        "can_be_merged",
+			RebaseInProgress:   false,
+			HasConflicts:       false,
+		},
+	}, nil
+}
+
+func (c *DirectionTrackingClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+	*c.capturedComparisons = append(*c.capturedComparisons, struct {
+		source string
+		target string
+	}{source: sourceBranch, target: targetBranch})
+	commits := make([]gitlab.CompareCommit, c.behindCount)
+	for i := 0; i < c.behindCount; i++ {
+		commits[i] = gitlab.CompareCommit{
+			ID:      "abc123" + string(rune('0'+i)),
+			ShortID: "abc12",
+			Title:   "Test commit",
+		}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
+}
+
+func init() {
+	logger, _ := zap.NewDevelopment()
+	zap.ReplaceGlobals(logger)
 }

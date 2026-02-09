@@ -1,6 +1,6 @@
 # 🧪 Auto-Rebase Testing Guide
 
-Complete guide for building, testing, and validating the generic auto-rebase feature with pipeline job checking, conflict detection, and optional atlantis comment checking.
+Complete guide for building, testing, and validating the auto-rebase feature with Compare API-based behind detection, conflict detection, and optional atlantis comment checking.
 
 ## ⚠️ Important: How Behind Detection Works
 
@@ -35,11 +35,11 @@ curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
 
 ## 📋 Overview
 
-This guide covers end-to-end testing of the enhanced auto-rebase logic that:
+This guide covers end-to-end testing of the auto-rebase logic that:
+- **Uses GitLab Compare API** to authoritatively determine if MR is behind (not unreliable MR fields)
 - Checks pipeline status (success/failed)
 - Validates all pipeline jobs succeeded
-- Checks for merge conflicts before and after rebase
-- Verifies rebase actually completed and commits were added
+- Verifies rebase completed successfully
 - Optionally checks latest atlantis-bot comments for plan failures (when enabled)
 - Distinguishes between state lock failures (allow rebase) and actual plan failures (skip rebase)
 

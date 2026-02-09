@@ -751,19 +751,17 @@ func (c *Client) verifyRebaseCompleted(projectID, mrIID int) (bool, error) {
 			continue
 		}
 
-		// Rebase completed - check if it was successful
-		// If behind_commits_count is now 0, rebase succeeded
+		// Rebase completed (RebaseInProgress is false) - immediately check outcome and exit
 		// If conflicts were introduced, merge_status will be "cannot_be_merged"
 		if mrDetails.HasConflicts || mrDetails.MergeStatus == "cannot_be_merged" {
 			return false, fmt.Errorf("rebase completed but conflicts were introduced (merge_status: %s)", mrDetails.MergeStatus)
 		}
 
-		// Rebase completed successfully
+		// Rebase completed successfully without conflicts
 		// Note: We no longer rely on behind_commits_count or diverged_commits_count as they are unreliable.
 		// The fact that rebase completed without conflicts is sufficient verification.
 		logging.Info("Rebase completed successfully for MR %d", mrIID)
 		return true, nil
-
 	}
 
 	// Timeout reached - rebase still in progress or verification incomplete

@@ -261,10 +261,12 @@ When `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=true`:
    - Job status (all jobs must succeed for failed pipelines)
    - Atlantis comments (if enabled, check for state lock vs plan errors)
 5. **Rebase**: Eligible MRs are rebased sequentially
-6. **Rebase Verification**: After triggering rebase:
+6. **Rebase**: Trigger rebase for eligible MRs
+7. **Rebase Verification**: After triggering rebase:
    - Polls MR status until `rebase_in_progress = false` (max 60 seconds)
+   - Once complete, immediately checks for conflicts and exits polling loop
    - Verifies no conflicts were introduced (`merge_status != cannot_be_merged`)
-7. **Notification**: Successfully rebased MRs receive an automated comment
+8. **Notification**: Successfully rebased MRs receive an automated comment
 
 ## 📋 Example Scenarios
 
