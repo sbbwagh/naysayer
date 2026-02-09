@@ -241,7 +241,7 @@ func (a *Analyzer) compareWarehouses(filePath string, oldDP, newDP *DataProduct)
 				changes = append(changes, WarehouseChange{
 					FilePath:   fmt.Sprintf("%s (type: %s)", filePath, whType),
 					FromSize:   oldSize,
-					ToSize:     "", // Empty for removed warehouses
+					ToSize:     "",   // Empty for removed warehouses
 					IsDecrease: true, // Removal is considered a decrease
 				})
 			}
