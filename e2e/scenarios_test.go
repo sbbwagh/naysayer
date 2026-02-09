@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -298,4 +299,72 @@ func normalizeWhitespace(s string) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// TestE2E_AutoRebase tests the auto-rebase flow using the mock client configured for autorebase.
+func TestE2E_AutoRebase(t *testing.T) {
+	// Use a temp dir for before/after (mock requires them)
+	tmpDir := t.TempDir()
+	beforeDir := filepath.Join(tmpDir, "before")
+	afterDir := filepath.Join(tmpDir, "after")
+	_ = os.MkdirAll(beforeDir, 0755)
+	_ = os.MkdirAll(afterDir, 0755)
+
+	mockGitLab := NewMockGitLabClient(beforeDir, afterDir)
+	mockGitLab.SetMRBranches("feature-branch", "main")
+	// Configure mock for auto-rebase E2E: one open MR, 1 commit behind
+	mockGitLab.OpenMRsForAutoRebase = []int{123}
+	mockGitLab.AutoRebaseBehindCount = 1
+
+	cfg := createTestConfig(t)
+	cfg.AutoRebase = config.AutoRebaseConfig{
+		Enabled:              true,
+		CheckAtlantisComments: false,
+		RepositoryToken:      "",
+	}
+
+	handler := webhook.NewAutoRebaseHandlerWithClient(cfg, mockGitLab)
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{
+			"id": 123,
+		},
+	}
+	jsonData, err := json.Marshal(payload)
+	assert.NoError(t, err)
+
+	req := httptest.NewRequest("POST", "/auto-rebase", bytes.NewReader(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 30000)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, resp.Body.Close())
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode, "response body: %s", string(body))
+
+	var response map[string]interface{}
+	err = json.Unmarshal(body, &response)
+	assert.NoError(t, err)
+	assert.Equal(t, "completed", response["status"])
+	assert.Equal(t, float64(1), response["successful"], "expected 1 successful rebase")
+	assert.Equal(t, float64(0), response["failed"])
+
+	// Assert the automated rebase comment was captured
+	var rebaseComment string
+	for _, c := range mockGitLab.CapturedComments {
+		if c.MRIID == 123 && strings.Contains(c.Comment, "Automated Rebase") {
+			rebaseComment = c.Comment
+			break
+		}
+	}
+	assert.NotEmpty(t, rebaseComment, "expected Automated Rebase comment to be posted to MR 123")
+	assert.Contains(t, rebaseComment, "Automated Rebase")
+	assert.Contains(t, rebaseComment, "automatically rebased")
 }

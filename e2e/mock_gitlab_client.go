@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/redhat-data-and-ai/naysayer/internal/gitlab"
 )
@@ -29,6 +30,11 @@ type MockGitLabClient struct {
 	CapturedComments  []CapturedComment
 	CapturedApprovals []CapturedApproval
 	FetchedFiles      []string
+
+	// Optional: for auto-rebase E2E tests. When set, ListOpenMRs/ListOpenMRsWithDetails return these MRs.
+	OpenMRsForAutoRebase []int
+	// Optional: for auto-rebase E2E. When >= 0, CompareBranches returns this many commits (behind). When < 0, returns 0 (up-to-date).
+	AutoRebaseBehindCount int
 }
 
 // CapturedComment represents a comment that would be posted to GitLab
@@ -243,13 +249,22 @@ func (m *MockGitLabClient) GetMRTargetBranch(projectID, mrIID int) (string, erro
 	return m.targetBranch, nil
 }
 
-// GetMRDetails returns MR details (minimal implementation for tests)
+// GetMRDetails returns MR details (minimal implementation for tests).
+// For autorebase eligibility, returns recent CreatedAt and success Pipeline when used with OpenMRsForAutoRebase.
 func (m *MockGitLabClient) GetMRDetails(projectID, mrIID int) (*gitlab.MRDetails, error) {
+	createdAt := time.Now().Add(-24 * time.Hour).Format(time.RFC3339) // 1 day ago
 	return &gitlab.MRDetails{
-		IID:          mrIID,
-		SourceBranch: m.sourceBranch,
-		TargetBranch: m.targetBranch,
-		ProjectID:    projectID,
+		IID:                mrIID,
+		SourceBranch:       m.sourceBranch,
+		TargetBranch:       m.targetBranch,
+		ProjectID:          projectID,
+		CreatedAt:          createdAt,
+		Pipeline:           &gitlab.MRPipeline{ID: 1, Status: "success"},
+		RebaseInProgress:   false,
+		HasConflicts:       false,
+		MergeStatus:        "can_be_merged",
+		BehindCommitsCount: 0,
+		DivergedCommitsCount: 0,
 	}, nil
 }
 
@@ -304,22 +319,35 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
-// CompareBranches is a no-op for mock client (compare functionality is not tested in e2e)
+// CompareBranches returns commits that target has but source doesn't (behind count).
+// For auto-rebase E2E, set AutoRebaseBehindCount >= 0 to return that many commits; otherwise returns 0 (up-to-date).
 func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
-	// Mock: return empty result (up-to-date)
-	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+	count := 0
+	if m.AutoRebaseBehindCount >= 0 {
+		count = m.AutoRebaseBehindCount
+	}
+	commits := make([]gitlab.CompareCommit, count)
+	for i := 0; i < count; i++ {
+		commits[i] = gitlab.CompareCommit{
+			ID:      fmt.Sprintf("e2e-commit-%d-%d", projectID, i+1),
+			ShortID: "e2e",
+			Title:   "E2E test commit",
+		}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
 }
 
-// RebaseMR is a no-op for mock client (rebase functionality is not tested in e2e)
+// RebaseMR simulates rebase for auto-rebase E2E. Returns success so the handler can post the automated comment.
 func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
-	// In e2e tests, we don't need to test rebase functionality
-	// Just return success
+	// In e2e tests, simulate success so autorebase flow completes and comment is captured
 	return true, true, nil
 }
 
-// ListOpenMRs is a stub for mock client
+// ListOpenMRs returns open MR IIDs. For auto-rebase E2E, set OpenMRsForAutoRebase to return specific MRs.
 func (m *MockGitLabClient) ListOpenMRs(projectID int) ([]int, error) {
-	// Return empty list for e2e tests
+	if len(m.OpenMRsForAutoRebase) > 0 {
+		return m.OpenMRsForAutoRebase, nil
+	}
 	return []int{}, nil
 }
 
