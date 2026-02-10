@@ -95,8 +95,8 @@ func (m *MockStaleMRClient) IsNaysayerBotAuthor(author map[string]interface{}) b
 func (m *MockStaleMRClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
 	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
 }
-func (m *MockStaleMRClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
-	return true, true, nil
+func (m *MockStaleMRClient) RebaseMR(projectID, mrIID int) (bool, error) {
+	return true, nil
 }
 func (m *MockStaleMRClient) ListOpenMRs(projectID int) ([]int, error) {
 	return nil, nil

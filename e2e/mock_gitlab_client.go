@@ -338,9 +338,8 @@ func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBr
 }
 
 // RebaseMR simulates rebase for auto-rebase E2E. Returns success so the handler can post the automated comment.
-func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
-	// In e2e tests, simulate success so autorebase flow completes and comment is captured
-	return true, true, nil
+func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, error) {
+	return true, nil
 }
 
 // ListOpenMRs returns open MR IIDs. For auto-rebase E2E, set OpenMRsForAutoRebase to return specific MRs.

@@ -507,8 +507,8 @@ func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBr
 	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
 }
 
-func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
-	return true, true, nil
+func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, error) {
+	return true, nil
 }
 
 func (m *MockGitLabClient) ListOpenMRs(projectID int) ([]int, error) {

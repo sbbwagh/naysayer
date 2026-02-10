@@ -41,16 +41,15 @@ func (m *MockRebaseGitLabClient) CompareBranches(projectID int, sourceBranch, ta
 	}, nil
 }
 
-func (m *MockRebaseGitLabClient) RebaseMR(projectID, mrIID int) (bool, bool, error) {
+func (m *MockRebaseGitLabClient) RebaseMR(projectID, mrIID int) (bool, error) {
 	m.capturedRebaseMRs = append(m.capturedRebaseMRs, struct {
 		projectID int
 		mrIID     int
 	}{projectID, mrIID})
 	if m.rebaseError != nil {
-		return false, false, m.rebaseError
+		return false, m.rebaseError
 	}
-	// Default: assume rebase was needed and succeeded
-	return true, true, nil
+	return true, nil
 }
 
 func (m *MockRebaseGitLabClient) AddMRComment(projectID, mrIID int, comment string) error {

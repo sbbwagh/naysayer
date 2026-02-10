@@ -16,6 +16,7 @@ import (
 
 	"github.com/redhat-data-and-ai/naysayer/internal/config"
 	"github.com/redhat-data-and-ai/naysayer/internal/logging"
+	"go.uber.org/zap"
 )
 
 // Client handles GitLab API operations
@@ -625,40 +626,29 @@ func (c *Client) AddOrUpdateMRComment(projectID, mrIID int, commentBody, comment
 	return c.AddMRComment(projectID, mrIID, commentBody)
 }
 
-// RebaseMR triggers a rebase for a merge request and verifies it completed successfully
-// Returns (success bool, actuallyRebased bool, error)
-// actuallyRebased indicates if the rebase was actually performed (false if already up-to-date or conflicts)
-func (c *Client) RebaseMR(projectID, mrIID int) (bool, bool, error) {
-	// Step 1: Check MR status before rebase to detect conflicts early
+// RebaseMR triggers a rebase for a merge request and verifies it completed successfully.
+// Caller should use CompareBranches() to decide if rebase is needed before calling this.
+func (c *Client) RebaseMR(projectID, mrIID int) (bool, error) {
 	mrDetails, err := c.GetMRDetails(projectID, mrIID)
 	if err != nil {
-		return false, false, fmt.Errorf("failed to get MR details before rebase: %w", err)
+		return false, fmt.Errorf("failed to get MR details before rebase: %w", err)
 	}
-
-	// Check if rebase is already in progress
 	if mrDetails.RebaseInProgress {
-		return false, false, fmt.Errorf("rebase already in progress for MR %d", mrIID)
+		return false, fmt.Errorf("rebase already in progress for MR %d", mrIID)
 	}
 
-	// Note: We no longer check MR fields like has_conflicts, merge_status, behind_commits_count, 
-	// or diverged_commits_count here as they are unreliable (can be null, stale, or blocked by approvals).
-	// The caller should use CompareBranches() to authoritatively determine if rebase is needed.
-
-	// Step 2: Trigger rebase
 	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/rebase",
 		strings.TrimRight(c.config.BaseURL, "/"), projectID, mrIID)
-
 	req, err := http.NewRequest("PUT", url, bytes.NewBuffer([]byte("{}")))
 	if err != nil {
-		return false, false, fmt.Errorf("failed to create rebase request: %w", err)
+		return false, fmt.Errorf("failed to create rebase request: %w", err)
 	}
-
 	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return false, false, fmt.Errorf("failed to rebase MR: %w", err)
+		return false, fmt.Errorf("failed to rebase MR: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -667,25 +657,22 @@ func (c *Client) RebaseMR(projectID, mrIID int) (bool, bool, error) {
 
 	switch resp.StatusCode {
 	case 202:
-		// Rebase queued - now verify it completes successfully
-		// Wait for rebase to complete (with timeout)
 		actuallyRebased, verifyErr := c.verifyRebaseCompleted(projectID, mrIID)
 		if verifyErr != nil {
-			return false, false, fmt.Errorf("rebase verification failed: %w", verifyErr)
+			return false, fmt.Errorf("rebase verification failed: %w", verifyErr)
 		}
 		if !actuallyRebased {
-			return false, false, fmt.Errorf("rebase failed: conflicts detected or rebase could not complete")
+			return false, fmt.Errorf("rebase failed: conflicts detected or rebase could not complete")
 		}
-		return true, true, nil
+		return true, nil
 	case 403:
-		return false, false, fmt.Errorf("rebase failed: insufficient permissions or rebase not allowed: %s", bodyStr)
+		return false, fmt.Errorf("rebase failed: insufficient permissions or rebase not allowed: %s", bodyStr)
 	case 404:
-		return false, false, fmt.Errorf("rebase failed: MR not found")
+		return false, fmt.Errorf("rebase failed: MR not found")
 	case 409:
-		// Conflicts detected synchronously
-		return false, false, fmt.Errorf("rebase failed: rebase already in progress or conflicts detected: %s", bodyStr)
+		return false, fmt.Errorf("rebase failed: rebase already in progress or conflicts detected: %s", bodyStr)
 	default:
-		return false, false, fmt.Errorf("rebase failed with status %d: %s", resp.StatusCode, bodyStr)
+		return false, fmt.Errorf("rebase failed with status %d: %s", resp.StatusCode, bodyStr)
 	}
 }
 
@@ -728,8 +715,8 @@ func (c *Client) CompareBranches(projectID int, sourceBranch, targetBranch strin
 	return &result, nil
 }
 
-// verifyRebaseCompleted polls the MR to verify rebase completed successfully
-// Returns (actuallyRebased bool, error)
+// verifyRebaseCompleted polls the MR to verify rebase completed successfully.
+// Returns (completedSuccessfully bool, error).
 func (c *Client) verifyRebaseCompleted(projectID, mrIID int) (bool, error) {
 	maxAttempts := 30        // 30 attempts
 	delay := 2 * time.Second // 2 seconds between attempts = max 60 seconds wait
@@ -739,28 +726,21 @@ func (c *Client) verifyRebaseCompleted(projectID, mrIID int) (bool, error) {
 
 		mrDetails, err := c.GetMRDetails(projectID, mrIID)
 		if err != nil {
-			// If we can't fetch details, continue polling
-			logging.Warn("Failed to get MR details during rebase verification, retrying... MR: %d, Attempt: %d, Error: %v", mrIID, attempt+1, err)
+			logging.MRWarn(mrIID, "Failed to get MR details during rebase verification, retrying",
+				zap.Int("attempt", attempt+1), zap.Error(err))
 			continue
 		}
 
-		// Check if rebase is still in progress
 		if mrDetails.RebaseInProgress {
-			// Still rebasing, continue waiting
-			logging.Info("Rebase still in progress, waiting... MR: %d, Attempt: %d", mrIID, attempt+1)
+			logging.MRInfo(mrIID, "Rebase still in progress, waiting", zap.Int("attempt", attempt+1))
 			continue
 		}
 
-		// Rebase completed (RebaseInProgress is false) - immediately check outcome and exit
-		// If conflicts were introduced, merge_status will be "cannot_be_merged"
 		if mrDetails.HasConflicts || mrDetails.MergeStatus == "cannot_be_merged" {
 			return false, fmt.Errorf("rebase completed but conflicts were introduced (merge_status: %s)", mrDetails.MergeStatus)
 		}
 
-		// Rebase completed successfully without conflicts
-		// Note: We no longer rely on behind_commits_count or diverged_commits_count as they are unreliable.
-		// The fact that rebase completed without conflicts is sufficient verification.
-		logging.Info("Rebase completed successfully for MR %d", mrIID)
+		logging.MRInfo(mrIID, "Rebase completed successfully")
 		return true, nil
 	}
 

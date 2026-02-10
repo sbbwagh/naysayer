@@ -253,7 +253,7 @@ func (h *AutoRebaseHandler) handlePushToMain(c *fiber.Ctx, payload map[string]in
 			zap.String("source_branch", mr.SourceBranch),
 			zap.String("target_branch", mr.TargetBranch))
 
-		success, actuallyRebased, err := h.gitlabClient.RebaseMR(projectID, mr.IID)
+		success, err := h.gitlabClient.RebaseMR(projectID, mr.IID)
 		if err != nil {
 			logging.Warn("Failed to rebase MR", zap.Int("mr_iid", mr.IID), zap.Error(err))
 			failureCount++
@@ -261,19 +261,13 @@ func (h *AutoRebaseHandler) handlePushToMain(c *fiber.Ctx, payload map[string]in
 				"mr_iid": mr.IID,
 				"error":  err.Error(),
 			})
-		} else if success && actuallyRebased {
+		} else if success {
 			logging.Info("Successfully rebased MR", zap.Int("mr_iid", mr.IID))
 			successCount++
-
-			// Only add comment if rebase was actually performed
 			commentBody := "🤖 **Automated Rebase**\n\nThis merge request has been automatically rebased with the latest changes from the target branch.\n\n_This is an automated action triggered by a push to the main branch._"
 			if commentErr := h.gitlabClient.AddMRComment(projectID, mr.IID, commentBody); commentErr != nil {
 				logging.Warn("Failed to add rebase comment to MR", zap.Int("mr_iid", mr.IID), zap.Error(commentErr))
 			}
-		} else if success && !actuallyRebased {
-			// Rebase API succeeded but no rebase was needed (already up-to-date)
-			logging.Info("Rebase not needed for MR (already up-to-date)", zap.Int("mr_iid", mr.IID))
-			// Don't count as success or failure, just skip
 		}
 	}
 
