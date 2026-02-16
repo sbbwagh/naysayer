@@ -28,7 +28,12 @@ type GitLabClient interface {
 	IsNaysayerBotAuthor(author map[string]interface{}) bool
 
 	// Rebase operations
-	RebaseMR(projectID, mrIID int) error
+	RebaseMR(projectID, mrIID int) (bool, error) // Returns (success, error)
+	CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*CompareResult, error)
+	// GetBranchCommit returns the commit SHA of the branch HEAD (for fork MR SHA-based compare)
+	GetBranchCommit(projectID int, branch string) (string, error)
+	// CompareCommits compares two commits by SHA in one project (used for fork MRs; GitLab cannot compare across projects by branch)
+	CompareCommits(projectID int, fromSHA, toSHA string) (*CompareResult, error)
 	ListOpenMRs(projectID int) ([]int, error)
 	ListOpenMRsWithDetails(projectID int) ([]MRDetails, error)
 

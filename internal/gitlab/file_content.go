@@ -110,21 +110,43 @@ func (c *Client) GetMRTargetBranch(projectID, mrIID int) (string, error) {
 
 // MRDetails represents merge request details
 type MRDetails struct {
-	TargetBranch    string      `json:"target_branch"`
-	SourceBranch    string      `json:"source_branch"`
-	IID             int         `json:"iid"`
-	ProjectID       int         `json:"project_id"`        // Target project ID
-	SourceProjectID int         `json:"source_project_id"` // Source project ID (for cross-fork MRs)
-	TargetProjectID int         `json:"target_project_id"` // Target project ID (same as ProjectID)
-	CreatedAt       string      `json:"created_at"`        // ISO 8601 format timestamp
-	UpdatedAt       string      `json:"updated_at"`        // ISO 8601 format timestamp of last activity
-	Pipeline        *MRPipeline `json:"pipeline"`          // Pipeline info (can be nil if no pipeline)
+	TargetBranch         string      `json:"target_branch"`
+	SourceBranch         string      `json:"source_branch"`
+	Sha                  string      `json:"sha"` // HEAD of source branch (used for fork MR compare)
+	IID                  int         `json:"iid"`
+	ProjectID            int         `json:"project_id"`             // Target project ID
+	SourceProjectID      int         `json:"source_project_id"`      // Source project ID (for cross-fork MRs)
+	TargetProjectID      int         `json:"target_project_id"`      // Target project ID (same as ProjectID)
+	CreatedAt            string      `json:"created_at"`             // ISO 8601 format timestamp
+	UpdatedAt            string      `json:"updated_at"`             // ISO 8601 format timestamp of last activity
+	Pipeline             *MRPipeline `json:"pipeline"`               // Pipeline info (can be nil if no pipeline)
+	BehindCommitsCount   int         `json:"behind_commits_count"`   // Number of commits behind target branch
+	DivergedCommitsCount int         `json:"diverged_commits_count"` // Number of diverged commits
+	MergeStatus          string      `json:"merge_status"`           // "can_be_merged", "cannot_be_merged", "checking", "unchecked"
+	RebaseInProgress     bool        `json:"rebase_in_progress"`     // True if rebase is currently in progress
+	HasConflicts         bool        `json:"has_conflicts"`          // True if MR has merge conflicts
 }
 
 // MRPipeline represents pipeline information for an MR
 type MRPipeline struct {
 	ID     int    `json:"id"`
 	Status string `json:"status"` // running, pending, success, failed, canceled, skipped
+}
+
+// CompareResult represents the result of comparing two branches
+type CompareResult struct {
+	Commits []CompareCommit `json:"commits"`
+}
+
+// CompareCommit represents a commit in a compare result
+type CompareCommit struct {
+	ID            string `json:"id"`
+	ShortID       string `json:"short_id"`
+	Title         string `json:"title"`
+	AuthorName    string `json:"author_name"`
+	AuthorEmail   string `json:"author_email"`
+	CommittedDate string `json:"committed_date"`
+	Message       string `json:"message"`
 }
 
 // GetMRDetails fetches merge request details

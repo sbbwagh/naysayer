@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/redhat-data-and-ai/naysayer/internal/config"
 	"github.com/redhat-data-and-ai/naysayer/internal/logging"
+	"go.uber.org/zap"
 )
 
 // Client handles GitLab API operations
@@ -624,40 +626,167 @@ func (c *Client) AddOrUpdateMRComment(projectID, mrIID int, commentBody, comment
 	return c.AddMRComment(projectID, mrIID, commentBody)
 }
 
-// RebaseMR triggers a rebase for a merge request
-func (c *Client) RebaseMR(projectID, mrIID int) error {
-	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/rebase",
-		strings.TrimRight(c.config.BaseURL, "/"), projectID, mrIID)
-
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer([]byte("{}")))
+// RebaseMR triggers a rebase for a merge request and verifies it completed successfully.
+// Caller should use CompareBranches() to decide if rebase is needed before calling this.
+func (c *Client) RebaseMR(projectID, mrIID int) (bool, error) {
+	mrDetails, err := c.GetMRDetails(projectID, mrIID)
 	if err != nil {
-		return fmt.Errorf("failed to create rebase request: %w", err)
+		return false, fmt.Errorf("failed to get MR details before rebase: %w", err)
+	}
+	if mrDetails.RebaseInProgress {
+		return false, fmt.Errorf("rebase already in progress for MR %d", mrIID)
 	}
 
+	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d/rebase",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, mrIID)
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer([]byte("{}")))
+	if err != nil {
+		return false, fmt.Errorf("failed to create rebase request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to rebase MR: %w", err)
+		return false, fmt.Errorf("failed to rebase MR: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
 	switch resp.StatusCode {
 	case 202:
-		return nil // Success - rebase accepted
+		actuallyRebased, verifyErr := c.verifyRebaseCompleted(projectID, mrIID)
+		if verifyErr != nil {
+			return false, fmt.Errorf("rebase verification failed: %w", verifyErr)
+		}
+		if !actuallyRebased {
+			return false, fmt.Errorf("rebase failed: conflicts detected or rebase could not complete")
+		}
+		return true, nil
 	case 403:
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("rebase failed: insufficient permissions or rebase not allowed: %s", string(body))
+		return false, fmt.Errorf("rebase failed: insufficient permissions or rebase not allowed: %s", bodyStr)
 	case 404:
-		return fmt.Errorf("rebase failed: MR not found")
+		return false, fmt.Errorf("rebase failed: MR not found")
 	case 409:
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("rebase failed: rebase already in progress or conflicts detected: %s", string(body))
+		return false, fmt.Errorf("rebase failed: rebase already in progress or conflicts detected: %s", bodyStr)
 	default:
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("rebase failed with status %d: %s", resp.StatusCode, string(body))
+		return false, fmt.Errorf("rebase failed with status %d: %s", resp.StatusCode, bodyStr)
 	}
+}
+
+// CompareBranches compares two branches in the same project using GitLab Compare API.
+// Use only for same-project MRs. For fork MRs use CompareCommits with MR.Sha (see auto_rebase).
+// Direction: from=sourceBranch, to=targetBranch (commits in target that source doesn't have).
+func (c *Client) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*CompareResult, error) {
+	if sourceProjectID != targetProjectID {
+		return nil, fmt.Errorf("CompareBranches does not support cross-project: use CompareCommits with MR.Sha for fork MRs")
+	}
+	encodedFrom := url.QueryEscape(sourceBranch)
+	encodedTo := url.QueryEscape(targetBranch)
+	apiURL := fmt.Sprintf("%s/api/v4/projects/%d/repository/compare?from=%s&to=%s",
+		strings.TrimRight(c.config.BaseURL, "/"), targetProjectID, encodedFrom, encodedTo)
+	return c.doCompare(apiURL)
+}
+
+// GetBranchCommit returns the commit SHA of the branch HEAD.
+// GET /projects/:id/repository/branches/:branch
+func (c *Client) GetBranchCommit(projectID int, branch string) (string, error) {
+	encodedBranch := url.QueryEscape(branch)
+	apiURL := fmt.Sprintf("%s/api/v4/projects/%d/repository/branches/%s",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, encodedBranch)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create get branch request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get branch: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("get branch failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	var branchInfo struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&branchInfo); err != nil {
+		return "", fmt.Errorf("failed to decode branch response: %w", err)
+	}
+	return branchInfo.Commit.ID, nil
+}
+
+// CompareCommits compares two commits by SHA in one project.
+// Used for fork MRs: GitLab cannot compare across projects by branch; use MR.Sha (source HEAD) and target branch SHA.
+// GET /projects/:id/repository/compare?from=<source_sha>&to=<target_sha>
+func (c *Client) CompareCommits(projectID int, fromSHA, toSHA string) (*CompareResult, error) {
+	encodedFrom := url.QueryEscape(fromSHA)
+	encodedTo := url.QueryEscape(toSHA)
+	apiURL := fmt.Sprintf("%s/api/v4/projects/%d/repository/compare?from=%s&to=%s",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, encodedFrom, encodedTo)
+	return c.doCompare(apiURL)
+}
+
+func (c *Client) doCompare(apiURL string) (*CompareResult, error) {
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create compare request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compare: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("compare failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	var result CompareResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode compare result: %w", err)
+	}
+	return &result, nil
+}
+
+// verifyRebaseCompleted polls the MR to verify rebase completed successfully.
+// Returns (completedSuccessfully bool, error).
+func (c *Client) verifyRebaseCompleted(projectID, mrIID int) (bool, error) {
+	maxAttempts := 30        // 30 attempts
+	delay := 2 * time.Second // 2 seconds between attempts = max 60 seconds wait
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		time.Sleep(delay)
+
+		mrDetails, err := c.GetMRDetails(projectID, mrIID)
+		if err != nil {
+			logging.MRWarn(mrIID, "Failed to get MR details during rebase verification, retrying",
+				zap.Int("attempt", attempt+1), zap.Error(err))
+			continue
+		}
+
+		if mrDetails.RebaseInProgress {
+			logging.MRInfo(mrIID, "Rebase still in progress, waiting", zap.Int("attempt", attempt+1))
+			continue
+		}
+
+		if mrDetails.HasConflicts || mrDetails.MergeStatus == "cannot_be_merged" {
+			return false, fmt.Errorf("rebase completed but conflicts were introduced (merge_status: %s)", mrDetails.MergeStatus)
+		}
+
+		logging.MRInfo(mrIID, "Rebase completed successfully")
+		return true, nil
+	}
+
+	// Timeout reached - rebase still in progress or verification incomplete
+	return false, fmt.Errorf("rebase verification timeout: max %d seconds exceeded", maxAttempts*int(delay.Seconds()))
 }
 
 // ListOpenMRs returns a list of open MR IIDs for a project
@@ -735,75 +864,6 @@ func (c *Client) ListOpenMRsWithDetails(projectID int) ([]MRDetails, error) {
 	}
 
 	return detailedMRs, nil
-}
-
-// GetPipelineJobs retrieves all jobs for a pipeline
-func (c *Client) GetPipelineJobs(projectID, pipelineID int) ([]PipelineJob, error) {
-	url := fmt.Sprintf("%s/api/v4/projects/%d/pipelines/%d/jobs",
-		strings.TrimRight(c.config.BaseURL, "/"), projectID, pipelineID)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pipeline jobs request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pipeline jobs: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get pipeline jobs failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var jobs []PipelineJob
-	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
-		return nil, fmt.Errorf("failed to decode pipeline jobs response: %w", err)
-	}
-
-	return jobs, nil
-}
-
-// JobTrace represents the trace content from a GitLab job
-type JobTrace struct {
-	Content string `json:"content"`
-}
-
-// GetJobTrace retrieves the trace/logs for a specific job
-func (c *Client) GetJobTrace(projectID, jobID int) (string, error) {
-	url := fmt.Sprintf("%s/api/v4/projects/%d/jobs/%d/trace",
-		strings.TrimRight(c.config.BaseURL, "/"), projectID, jobID)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create job trace request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to get job trace: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("get job trace failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var trace JobTrace
-	if err := json.NewDecoder(resp.Body).Decode(&trace); err != nil {
-		return "", fmt.Errorf("failed to decode job trace response: %w", err)
-	}
-
-	return trace.Content, nil
 }
 
 // ListAllOpenMRsWithDetails lists all open merge requests for a project (no date filter)
@@ -884,6 +944,75 @@ func (c *Client) CloseMR(projectID, mrIID int) error {
 
 	logging.Info("Successfully closed MR !%d in project %d", mrIID, projectID)
 	return nil
+}
+
+// GetPipelineJobs retrieves all jobs for a pipeline
+func (c *Client) GetPipelineJobs(projectID, pipelineID int) ([]PipelineJob, error) {
+	url := fmt.Sprintf("%s/api/v4/projects/%d/pipelines/%d/jobs",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, pipelineID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pipeline jobs request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pipeline jobs: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get pipeline jobs failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var jobs []PipelineJob
+	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+		return nil, fmt.Errorf("failed to decode pipeline jobs response: %w", err)
+	}
+
+	return jobs, nil
+}
+
+// JobTrace represents the trace content from a GitLab job
+type JobTrace struct {
+	Content string `json:"content"`
+}
+
+// GetJobTrace retrieves the trace/logs for a specific job
+func (c *Client) GetJobTrace(projectID, jobID int) (string, error) {
+	url := fmt.Sprintf("%s/api/v4/projects/%d/jobs/%d/trace",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, jobID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create job trace request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get job trace: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("get job trace failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var trace JobTrace
+	if err := json.NewDecoder(resp.Body).Decode(&trace); err != nil {
+		return "", fmt.Errorf("failed to decode job trace response: %w", err)
+	}
+
+	return trace.Content, nil
 }
 
 // FindLatestAtlantisComment finds the latest comment from atlantis-bot

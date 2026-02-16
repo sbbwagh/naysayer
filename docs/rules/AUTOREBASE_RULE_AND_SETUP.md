@@ -185,24 +185,52 @@ kubectl logs -f deployment/naysayer | grep -i "auto-rebase\|rebase"
 
 ## 🔍 How It Works
 
+### ⚠️ Important: Why We Use Compare API (Not MR Fields)
+
+**GitLab MR fields are unreliable for determining if rebase is needed:**
+
+| Field | Why Unreliable |
+|-------|----------------|
+| `behind_commits_count` | Often returns `0` even when MR is behind; can be null or stale |
+| `diverged_commits_count` | Doesn't consistently indicate source is behind target |
+| `merge_status` | Can be `"checking"` indefinitely; blocked by approval rules; doesn't reflect behind status |
+| `detailed_merge_status` | Can be null or inaccurate |
+
+**✅ GitLab Compare API is the AUTHORITATIVE source:**
+- Same-project: `GET /projects/:id/repository/compare?from=<source_branch>&to=<target_branch>`
+- Fork MRs: GitLab cannot compare across projects by branch. Naysayer uses **SHA-based compare** in the upstream project: MR `.sha` (source branch HEAD) and target branch SHA, then `compare?from=<sha>&to=<target_sha>` in the target project.
+- **Direction**: `from=source`, `to=target` (commits in target that source doesn't have)
+- `commits` array length = number of commits behind
+- **This is what the GitLab UI uses** to show "X commits behind"
+
 ### Eligibility Criteria
 
 An MR is eligible for auto-rebase if **ALL** of the following are true:
 
 1. ✅ **Age**: Created within the last **7 days**
-2. ✅ **Pipeline Status**: 
+2. ✅ **Behind Target Branch**: Source branch is missing commits from target branch
+   - **Determined using GitLab Compare API** (authoritative)
+   - `GET /projects/:id/repository/compare?from=<source>&to=<target>`
+   - If `commits` array is non-empty, rebase is needed
+   - ⚠️ **Do NOT rely on MR fields** (`behind_commits_count`, `diverged_commits_count`, `merge_status`, `detailed_merge_status`) - these are unreliable, can be null/stale, or blocked by approval rules
+3. ✅ **No Rebase in Progress**: MR is not currently being rebased (`rebase_in_progress = false`)
+4. ✅ **Pipeline Status**: 
    - Pipeline is `success` → Rebase directly
    - Pipeline is `failed` → Check jobs and optionally atlantis comments (see below)
    - Pipeline is `null` (no pipeline) → Rebase
-3. ✅ **State**: MR is in `opened` state
+5. ✅ **State**: MR is in `opened` state
 
 ### Skip Conditions
 
 An MR is **skipped** (not rebased) if **ANY** of the following are true:
 
 1. ❌ **Too Old**: Created more than 7 days ago
-2. ❌ **Active Pipeline**: Pipeline status is `running` or `pending`
-3. ❌ **Failed Pipeline**: 
+2. ❌ **Already Up-to-Date**: Source branch already contains all target branch commits
+   - **Determined using GitLab Compare API** (authoritative)
+   - If `commits` array is empty, no rebase needed
+3. ❌ **Rebase in Progress**: MR is currently being rebased (`rebase_in_progress = true`)
+4. ❌ **Active Pipeline**: Pipeline status is `running` or `pending`
+5. ❌ **Failed Pipeline**: 
    - If `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=false`: Skip all failed pipelines
    - If `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=true`: 
      - Skip if jobs failed
@@ -221,12 +249,25 @@ When `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=true`:
 
 1. **Webhook Trigger**: Push to `main`/`master` branch triggers webhook
 2. **MR Discovery**: System fetches all open MRs created in last 7 days
-3. **Filtering**: MRs are filtered based on:
+3. **Pre-Rebase Checks**: For each MR:
+   - **Compare using GitLab Compare API** (authoritative check)
+     - **Same-project MRs**: `GET /projects/:id/repository/compare?from=<source_branch>&to=<target_branch>`
+     - **Fork MRs**: Get MR `.sha` (source HEAD) and target branch SHA; `GET /projects/:target_id/repository/compare?from=<mr.sha>&to=<target_branch_sha>` (GitLab cannot compare across projects by branch)
+     - Parse `commits` array length to determine if behind
+     - If `commits.length == 0` → Skip (already up-to-date)
+     - If `commits.length > 0` → Continue to rebase
+   - Check if rebase in progress (`rebase_in_progress = true`) → Skip
+4. **Filtering**: MRs are filtered based on:
    - Pipeline status (success → rebase, failed → check jobs)
    - Job status (all jobs must succeed for failed pipelines)
    - Atlantis comments (if enabled, check for state lock vs plan errors)
-4. **Rebase**: Eligible MRs are rebased sequentially
-5. **Notification**: Successfully rebased MRs receive an automated comment
+5. **Rebase**: Eligible MRs are rebased sequentially
+6. **Rebase**: Trigger rebase for eligible MRs
+7. **Rebase Verification**: After triggering rebase:
+   - Polls MR status until `rebase_in_progress = false` (max 60 seconds)
+   - Once complete, immediately checks for conflicts and exits polling loop
+   - Verifies no conflicts were introduced (`merge_status != cannot_be_merged`)
+8. **Notification**: Successfully rebased MRs receive an automated comment
 
 ## 📋 Example Scenarios
 
@@ -381,17 +422,47 @@ curl -H "Authorization: Bearer $AUTO_REBASE_REPOSITORY_TOKEN" \
 **Symptoms**: Rebase attempts fail with errors
 
 **Solutions**:
-1. **Check MR mergeability**: Ensure MR can be rebased (no conflicts, not locked)
-2. **Verify branch permissions**: Ensure token has write access to repository
-3. **Check GitLab rate limits**: Verify you're not hitting API rate limits
-4. **Review error details**: Check `failures` array in webhook response
+1. **Verify MR actually needs rebase**: Use Compare API to check
+   ```bash
+   # Check if MR is behind target branch (authoritative method)
+   curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+     "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
+     | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+   ```
+   - If `behind_count == 0`, no rebase is needed
+   - If `behind_count > 0`, rebase should proceed
+   - ⚠️ **Do NOT rely on MR fields** (`behind_commits_count`, `diverged_commits_count`) - they are unreliable
+2. **Check rebase verification**: If rebase is triggered but fails during verification:
+   - System polls for up to 60 seconds to verify rebase completed
+   - If conflicts are introduced during rebase, it's marked as failed
+   - Check logs for "rebase verification failed" messages
+3. **Verify branch permissions**: Ensure token has write access to repository
+4. **Check GitLab rate limits**: Verify you're not hitting API rate limits
+5. **Review error details**: Check `failures` array in webhook response
 
 **Debug Commands**:
 ```bash
-# Check MR mergeability
+# Same-project MR: compare by branch
+curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+
+# Fork MR: compare by SHA in upstream project (GitLab cannot compare across projects by branch)
+FORK_SHA=$(curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/merge_requests/$MR_IID" | jq -r '.sha')
+MAIN_SHA=$(curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/branches/main" | jq -r '.commit.id')
+curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/compare?from=$FORK_SHA&to=$MAIN_SHA" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+
+# Example output - MR needs rebase: {"behind_count": 1, "behind_commits": ["..."]}
+# Example output - up-to-date: {"behind_count": 0, "behind_commits": []}
+
+# Check MR details (less reliable, for reference only)
 curl -H "Authorization: Bearer $AUTO_REBASE_REPOSITORY_TOKEN" \
   "$GITLAB_BASE_URL/api/v4/projects/YOUR_PROJECT_ID/merge_requests/MR_IID" \
-  | jq '{mergeable: .mergeable, merge_status: .merge_status, rebase_in_progress: .rebase_in_progress}'
+  | jq '{iid, source_branch, target_branch, rebase_in_progress, merge_status}'
 
 # Manually trigger rebase to test
 curl -X PUT -H "Authorization: Bearer $AUTO_REBASE_REPOSITORY_TOKEN" \

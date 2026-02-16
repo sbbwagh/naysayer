@@ -134,7 +134,7 @@ curl -X POST https://your-naysayer-domain.com/auto-rebase \
 | Field | Type | Description |
 |-------|------|-------------|
 | `mr_iid` | number | Merge request IID |
-| `reason` | string | Skip reason (`pipeline_running`, `pipeline_pending`, `pipeline_failed`, `pipeline_failed_atlantis_comment_not_found`, `pipeline_failed_atlantis_plan_failed`, `pipeline_jobs_failed`, `too_old`) |
+| `reason` | string | Skip reason (`pipeline_running`, `pipeline_pending`, `pipeline_failed`, `pipeline_failed_atlantis_comment_not_found`, `pipeline_failed_atlantis_plan_failed`, `pipeline_jobs_failed`, `too_old`, `already_up_to_date`, `rebase_in_progress`, `compare_failed`) |
 | `pipeline_id` | number | Pipeline ID (if skipped due to pipeline status) |
 | `created_at` | string | MR creation date (if skipped due to age) |
 
@@ -146,12 +146,46 @@ curl -X POST https://your-naysayer-domain.com/auto-rebase \
 
 **Eligibility Criteria**:
 - MR must be created within the last **7 days**
+- **MR must be behind target branch** (determined using GitLab Compare API - authoritative)
+  - Uses `GET /projects/:id/repository/compare?from=<source>&to=<target>`
+  - If `commits` array is non-empty, rebase is needed
+  - ⚠️ **Do NOT rely on MR fields** (`behind_commits_count`, `diverged_commits_count`, `merge_status`) - these are unreliable, can be null/stale, or blocked by approval rules
+- MR must not have a rebase in progress (`rebase_in_progress = false`)
 - MR pipeline status:
   - `success` → Rebase directly
   - `failed` → Check all jobs succeeded, then optionally check atlantis comments (if `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=true`)
   - `null` (no pipeline) → Rebase
 - MRs with `running` or `pending` pipelines are skipped
 - Only push events to `main` or `master` branches trigger rebase operations
+
+**Behind Detection (Compare API)**:
+- Same-project MRs: compare by branch names in one project.
+- Fork MRs: GitLab cannot compare across projects by branch. Naysayer uses **SHA-based compare** in the upstream project: get MR `.sha` (source branch HEAD), get target branch SHA, then `compare?from=<MR.sha>&to=<target_sha>` in the upstream project.
+
+```bash
+# Same-project: compare by branch
+curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+
+# Fork MR: get source SHA from MR, target SHA from branch, then compare in upstream project
+FORK_SHA=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/merge_requests/$MR_IID" | jq -r '.sha')
+MAIN_SHA=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/branches/main" | jq -r '.commit.id')
+curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/compare?from=$FORK_SHA&to=$MAIN_SHA" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+```
+- `behind_count > 0` → MR needs rebase; `behind_count == 0` → up-to-date, skip rebase
+- Direction: `from=source` (or source SHA), `to=target` (or target SHA)
+
+**Rebase Verification**:
+- After triggering a rebase, the system verifies that the rebase completed successfully:
+  - Polls the MR status until `rebase_in_progress = false` (max 60 seconds)
+  - Checks that no conflicts were introduced (`merge_status != cannot_be_merged`)
+- Only posts success comment if rebase was actually performed
+- If conflicts are detected during or after rebase, the rebase is marked as failed
 
 **Atlantis Comment Checking** (when `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=true`):
 - For failed pipelines with all jobs succeeded:

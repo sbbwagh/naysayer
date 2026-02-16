@@ -92,7 +92,18 @@ func (m *MockStaleMRClient) GetCurrentBotUsername() (string, error)           { 
 func (m *MockStaleMRClient) IsNaysayerBotAuthor(author map[string]interface{}) bool {
 	return false
 }
-func (m *MockStaleMRClient) RebaseMR(projectID, mrIID int) error { return nil }
+func (m *MockStaleMRClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+func (m *MockStaleMRClient) GetBranchCommit(projectID int, branch string) (string, error) {
+	return "mock-sha", nil
+}
+func (m *MockStaleMRClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+func (m *MockStaleMRClient) RebaseMR(projectID, mrIID int) (bool, error) {
+	return true, nil
+}
 func (m *MockStaleMRClient) ListOpenMRs(projectID int) ([]int, error) {
 	return nil, nil
 }

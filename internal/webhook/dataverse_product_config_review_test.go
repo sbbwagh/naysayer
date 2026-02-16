@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/redhat-data-and-ai/naysayer/internal/config"
 	"github.com/redhat-data-and-ai/naysayer/internal/gitlab"
 	"github.com/redhat-data-and-ai/naysayer/internal/rules/shared"
-	"github.com/stretchr/testify/assert"
 )
 
 // MockRuleManager for testing
@@ -502,8 +503,18 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
-func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) error {
-	return nil
+func (m *MockGitLabClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+func (m *MockGitLabClient) GetBranchCommit(projectID int, branch string) (string, error) {
+	return "mock-sha", nil
+}
+func (m *MockGitLabClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+
+func (m *MockGitLabClient) RebaseMR(projectID, mrIID int) (bool, error) {
+	return true, nil
 }
 
 func (m *MockGitLabClient) ListOpenMRs(projectID int) ([]int, error) {

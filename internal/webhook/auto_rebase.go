@@ -212,9 +212,114 @@ func (h *AutoRebaseHandler) handlePushToMain(c *fiber.Ctx, payload map[string]in
 	failures := make([]map[string]interface{}, 0)
 
 	for _, mr := range eligibleMRs {
-		logging.Info("Attempting to rebase MR", zap.Int("mr_iid", mr.IID))
+		// Determine source project ID (handles fork MRs)
+		sourceProjectID := mr.SourceProjectID
+		if sourceProjectID == 0 {
+			sourceProjectID = projectID // Same-project MR
+		}
+		isForkMR := sourceProjectID != projectID
 
-		err := h.gitlabClient.RebaseMR(projectID, mr.IID)
+		var compareResult *gitlab.CompareResult
+		var err error
+
+		if isForkMR {
+			// GitLab REST API cannot compare across projects by branch name.
+			// Use SHA-based compare in the target (upstream) project:
+			// 1) MR.sha = source branch HEAD, 2) get target branch SHA, 3) compare in target project.
+			if mr.Sha == "" {
+				// Fetch full MR details to get sha (list endpoint may not include it)
+				details, getErr := h.gitlabClient.GetMRDetails(projectID, mr.IID)
+				if getErr != nil || details.Sha == "" {
+					logging.Warn("Fork MR has no sha, skipping rebase",
+						zap.Int("mr_iid", mr.IID),
+						zap.Int("source_project_id", sourceProjectID),
+						zap.Error(getErr))
+					failureCount++
+					failures = append(failures, map[string]interface{}{
+						"mr_iid": mr.IID,
+						"error":  "fork MR missing source branch sha",
+					})
+					continue
+				}
+				mr.Sha = details.Sha
+			}
+			targetBranchSHA, err := h.gitlabClient.GetBranchCommit(projectID, mr.TargetBranch)
+			if err != nil {
+				logging.Warn("Failed to get target branch commit for fork MR, skipping rebase",
+					zap.Int("mr_iid", mr.IID),
+					zap.String("target_branch", mr.TargetBranch),
+					zap.Error(err))
+				failureCount++
+				failures = append(failures, map[string]interface{}{
+					"mr_iid": mr.IID,
+					"error":  fmt.Sprintf("failed to get target branch sha: %v", err),
+				})
+				continue
+			}
+			var res *gitlab.CompareResult
+			res, err = h.gitlabClient.CompareCommits(projectID, mr.Sha, targetBranchSHA)
+			if err == nil {
+				compareResult = res
+			}
+		} else {
+			// Same-project: compare by branch name
+			var res *gitlab.CompareResult
+			res, err = h.gitlabClient.CompareBranches(projectID, mr.SourceBranch, projectID, mr.TargetBranch)
+			if err == nil {
+				compareResult = res
+			}
+		}
+
+		if err != nil {
+			logging.Warn("Failed to compare for MR, skipping rebase",
+				zap.Int("mr_iid", mr.IID),
+				zap.Int("source_project_id", sourceProjectID),
+				zap.String("source_branch", mr.SourceBranch),
+				zap.Int("target_project_id", projectID),
+				zap.String("target_branch", mr.TargetBranch),
+				zap.Bool("is_fork_mr", isForkMR),
+				zap.Error(err))
+			failureCount++
+			failures = append(failures, map[string]interface{}{
+				"mr_iid": mr.IID,
+				"error":  fmt.Sprintf("failed to compare: %v", err),
+			})
+			continue
+		}
+
+		behindByCompare := len(compareResult.Commits)
+		logging.Info("Evaluating MR for rebase",
+			zap.Int("mr_iid", mr.IID),
+			zap.Int("source_project_id", sourceProjectID),
+			zap.String("source_branch", mr.SourceBranch),
+			zap.Int("target_project_id", projectID),
+			zap.String("target_branch", mr.TargetBranch),
+			zap.Bool("is_fork_mr", isForkMR),
+			zap.Int("behind_by_compare", behindByCompare))
+
+		// AUTHORITATIVE CHECK: Use Compare API result to determine if rebase is needed
+		// If behind_by_compare == 0, source branch already contains all target branch commits
+		if behindByCompare == 0 {
+			logging.Info("Skipping rebase: source branch already contains target branch commits",
+				zap.Int("mr_iid", mr.IID),
+				zap.Int("source_project_id", sourceProjectID),
+				zap.String("source_branch", mr.SourceBranch),
+				zap.Int("target_project_id", projectID),
+				zap.String("target_branch", mr.TargetBranch),
+				zap.Bool("is_fork_mr", isForkMR))
+			continue
+		}
+
+		logging.Info("Rebase required: target branch has commits missing in source branch",
+			zap.Int("mr_iid", mr.IID),
+			zap.Int("source_project_id", sourceProjectID),
+			zap.String("source_branch", mr.SourceBranch),
+			zap.Int("target_project_id", projectID),
+			zap.String("target_branch", mr.TargetBranch),
+			zap.Bool("is_fork_mr", isForkMR),
+			zap.Int("behind_by_compare", behindByCompare))
+
+		success, err := h.gitlabClient.RebaseMR(projectID, mr.IID)
 		if err != nil {
 			logging.Warn("Failed to rebase MR", zap.Int("mr_iid", mr.IID), zap.Error(err))
 			failureCount++
@@ -222,15 +327,19 @@ func (h *AutoRebaseHandler) handlePushToMain(c *fiber.Ctx, payload map[string]in
 				"mr_iid": mr.IID,
 				"error":  err.Error(),
 			})
-		} else {
-			logging.Info("Successfully triggered rebase for MR", zap.Int("mr_iid", mr.IID))
+			// When rebase fails due to fork permissions (cannot push to source branch), comment on the MR so author knows to rebase manually
+			if isForkRebasePermissionError(err) {
+				forkComment := "🤖 **Auto-rebase attempted**\n\nThis merge request is from a fork. Automated rebase was attempted but cannot push to the fork's source branch (insufficient permissions). Please **rebase manually** to bring in the latest changes from the target branch.\n\n_This is an automated message._"
+				if commentErr := h.gitlabClient.AddMRComment(projectID, mr.IID, forkComment); commentErr != nil {
+					logging.Warn("Failed to add fork rebase comment to MR", zap.Int("mr_iid", mr.IID), zap.Error(commentErr))
+				}
+			}
+		} else if success {
+			logging.Info("Successfully rebased MR", zap.Int("mr_iid", mr.IID))
 			successCount++
-
-			// Add comment to MR informing users about the automated rebase
 			commentBody := "🤖 **Automated Rebase**\n\nThis merge request has been automatically rebased with the latest changes from the target branch.\n\n_This is an automated action triggered by a push to the main branch._"
 			if commentErr := h.gitlabClient.AddMRComment(projectID, mr.IID, commentBody); commentErr != nil {
 				logging.Warn("Failed to add rebase comment to MR", zap.Int("mr_iid", mr.IID), zap.Error(commentErr))
-				// Don't fail the rebase if comment fails
 			}
 		}
 	}
@@ -260,6 +369,16 @@ func (h *AutoRebaseHandler) handlePushToMain(c *fiber.Ctx, payload map[string]in
 		zap.Int("failed", failureCount))
 
 	return c.JSON(response)
+}
+
+// isForkRebasePermissionError returns true when the error indicates GitLab rejected rebase due to lack of push access to the source branch (e.g. fork MRs).
+func isForkRebasePermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cannot push to source branch") ||
+		(strings.Contains(msg, "403") && strings.Contains(msg, "forbidden") && strings.Contains(msg, "push"))
 }
 
 // MRSkipInfo holds information about why an MR was skipped
