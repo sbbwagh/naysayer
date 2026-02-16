@@ -30,10 +30,23 @@ type MockRebaseGitLabClient struct {
 		projectID int
 		mrIID     int
 	}
+	// For fork MR testing
+	sourceProjectID int // Set to non-zero to simulate fork MR
 }
 
-func (m *MockRebaseGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
-	// Mock: return 1 commit behind by default (needs rebase)
+func (m *MockRebaseGitLabClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{
+		Commits: []gitlab.CompareCommit{
+			{ID: "abc123", ShortID: "abc123", Title: "Mock commit"},
+		},
+	}, nil
+}
+
+func (m *MockRebaseGitLabClient) GetBranchCommit(projectID int, branch string) (string, error) {
+	return "mock-main-sha", nil
+}
+
+func (m *MockRebaseGitLabClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
 	return &gitlab.CompareResult{
 		Commits: []gitlab.CompareCommit{
 			{ID: "abc123", ShortID: "abc123", Title: "Mock commit"},
@@ -67,13 +80,25 @@ func (m *MockRebaseGitLabClient) GetMRTargetBranch(projectID, mrIID int) (string
 }
 
 func (m *MockRebaseGitLabClient) GetMRDetails(projectID, mrIID int) (*gitlab.MRDetails, error) {
-	// Return basic MR details for the mock
-	// This is called by ListOpenMRsWithDetails now
+	sourceProjectID := m.sourceProjectID
+	if sourceProjectID == 0 {
+		sourceProjectID = projectID
+	}
+	sha := "" // Same-project MRs don't need sha for compare
+	if sourceProjectID != projectID {
+		sha = "mock-fork-sha-" + string(rune('0'+mrIID%10))
+	}
 	return &gitlab.MRDetails{
 		IID:                mrIID,
-		CreatedAt:          time.Now().Add(-24 * time.Hour).Format(time.RFC3339), // 1 day ago
+		SourceBranch:       "feature-branch",
+		TargetBranch:       "main",
+		Sha:                sha,
+		ProjectID:          projectID,
+		SourceProjectID:    sourceProjectID,
+		TargetProjectID:    projectID,
+		CreatedAt:          time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
 		Pipeline:           &gitlab.MRPipeline{Status: "success"},
-		BehindCommitsCount: 1, // Default: 1 commit behind to allow rebase
+		BehindCommitsCount: 1,
 		MergeStatus:        "can_be_merged",
 		RebaseInProgress:   false,
 		HasConflicts:       false,
@@ -393,6 +418,65 @@ func TestFivetranTerraformRebaseHandler_HandleWebhook_RebaseError(t *testing.T) 
 
 	// Verify no comments were added due to failures
 	assert.Len(t, mockClient.capturedComments, 0)
+}
+
+func TestAutoRebase_ForkPermissionErrorPostsComment(t *testing.T) {
+	cfg := createTestConfig()
+	mockClient := &MockRebaseGitLabClient{
+		openMRs:     []int{913},
+		rebaseError: fmt.Errorf("rebase failed: insufficient permissions or rebase not allowed: {\"message\":\"403 Forbidden - Cannot push to source branch\"}"),
+	}
+	handler := NewAutoRebaseHandlerWithClient(cfg, mockClient)
+
+	app := createTestApp()
+	app.Post("/rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{
+			"id": 94023,
+		},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/rebase", bytes.NewReader(payloadBytes))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	var response map[string]interface{}
+	_ = json.Unmarshal(body, &response)
+
+	assert.Equal(t, float64(1), response["failed"])
+	// When rebase fails due to fork permission, we post a comment explaining manual rebase is needed
+	assert.Len(t, mockClient.capturedComments, 1)
+	assert.Contains(t, mockClient.capturedComments[0], "Auto-rebase attempted")
+	assert.Contains(t, mockClient.capturedComments[0], "rebase manually")
+	assert.Contains(t, mockClient.capturedComments[0], "fork")
+}
+
+func TestIsForkRebasePermissionError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"nil", nil, false},
+		{"cannot push to source branch", fmt.Errorf("403 Forbidden - Cannot push to source branch"), true},
+		{"wrapped message", fmt.Errorf("rebase failed: {\"message\":\"403 Forbidden - Cannot push to source branch\"}"), true},
+		{"403 and push", fmt.Errorf("403 forbidden: cannot push"), true},
+		{"conflicts", fmt.Errorf("rebase failed: conflicts detected"), false},
+		{"generic", fmt.Errorf("something went wrong"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isForkRebasePermissionError(tt.err)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
 }
 
 func TestFivetranTerraformRebaseHandler_HandleWebhook_InvalidContentType(t *testing.T) {
@@ -834,7 +918,7 @@ func TestAutoRebase_SkipsUpToDateMR(t *testing.T) {
 	payload := map[string]interface{}{
 		"object_kind": "push",
 		"ref":         "refs/heads/main",
-		"project": map[string]interface{}{"id": 123},
+		"project":     map[string]interface{}{"id": 123},
 	}
 	payloadBytes, _ := json.Marshal(payload)
 	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
@@ -872,7 +956,7 @@ func TestAutoRebase_RebasesBehindMR(t *testing.T) {
 	payload := map[string]interface{}{
 		"object_kind": "push",
 		"ref":         "refs/heads/main",
-		"project": map[string]interface{}{"id": 123},
+		"project":     map[string]interface{}{"id": 123},
 	}
 	payloadBytes, _ := json.Marshal(payload)
 	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
@@ -912,7 +996,7 @@ func TestAutoRebase_CompareAPIFailure(t *testing.T) {
 	payload := map[string]interface{}{
 		"object_kind": "push",
 		"ref":         "refs/heads/main",
-		"project": map[string]interface{}{"id": 123},
+		"project":     map[string]interface{}{"id": 123},
 	}
 	payloadBytes, _ := json.Marshal(payload)
 	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
@@ -956,7 +1040,7 @@ func TestAutoRebase_LogsCompareResults(t *testing.T) {
 	payload := map[string]interface{}{
 		"object_kind": "push",
 		"ref":         "refs/heads/main",
-		"project": map[string]interface{}{"id": 123},
+		"project":     map[string]interface{}{"id": 123},
 	}
 	payloadBytes, _ := json.Marshal(payload)
 	req := httptest.NewRequest("POST", "/auto-rebase", strings.NewReader(string(payloadBytes)))
@@ -975,7 +1059,7 @@ type CustomCompareGitLabClient struct {
 	compareError      error
 }
 
-func (c *CustomCompareGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+func (c *CustomCompareGitLabClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
 	if c.compareError != nil {
 		return nil, c.compareError
 	}
@@ -1016,7 +1100,7 @@ func TestAutoRebase_MixedBehindStatus(t *testing.T) {
 			mockClient.openMRs = tt.mrIIDs
 			customMockClient := &MultiMRCompareClient{
 				MockRebaseGitLabClient: mockClient,
-				behindCounts:            tt.behindCounts,
+				behindCounts:           tt.behindCounts,
 			}
 			cfg := createTestConfig()
 			handler := NewAutoRebaseHandlerWithClient(cfg, customMockClient)
@@ -1046,7 +1130,7 @@ type MultiMRCompareClient struct {
 
 var multiMRCounter int
 
-func (c *MultiMRCompareClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+func (c *MultiMRCompareClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
 	mrIID := c.openMRs[multiMRCounter%len(c.openMRs)]
 	multiMRCounter++
 	behindCount := c.behindCounts[mrIID]
@@ -1173,7 +1257,7 @@ func (c *DirectionTrackingClient) ListOpenMRsWithDetails(projectID int) ([]gitla
 	}, nil
 }
 
-func (c *DirectionTrackingClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+func (c *DirectionTrackingClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
 	*c.capturedComparisons = append(*c.capturedComparisons, struct {
 		source string
 		target string
@@ -1185,6 +1269,169 @@ func (c *DirectionTrackingClient) CompareBranches(projectID int, sourceBranch, t
 			ShortID: "abc12",
 			Title:   "Test commit",
 		}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
+}
+
+// TestAutoRebase_ForkMR tests auto-rebase with a fork MR (cross-project)
+func TestAutoRebase_ForkMR(t *testing.T) {
+	mockClient := &ForkMRCompareClient{
+		MockRebaseGitLabClient: &MockRebaseGitLabClient{
+			openMRs:           []int{100},
+			capturedRebaseMRs: make([]struct{ projectID, mrIID int }, 0),
+			capturedComments:  make([]string, 0),
+			sourceProjectID:   456, // Fork MR: source is in project 456
+		},
+		behindCount: 1,
+	}
+
+	cfg := &config.Config{
+		GitLab: config.GitLabConfig{
+			BaseURL: "https://gitlab.example.com",
+			Token:   "test-token",
+		},
+		AutoRebase: config.AutoRebaseConfig{
+			Enabled:               true,
+			CheckAtlantisComments: false,
+			RepositoryToken:       "test-token",
+		},
+		Comments: config.CommentsConfig{
+			EnableMRComments: true,
+		},
+	}
+
+	handler := NewAutoRebaseHandlerWithClient(cfg, mockClient)
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{
+			"id": 123,
+		},
+	}
+	jsonData, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/auto-rebase", bytes.NewReader(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 30000)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, 200, resp.StatusCode, "response body: %s", string(body))
+
+	var response map[string]interface{}
+	_ = json.Unmarshal(body, &response)
+
+	assert.Equal(t, "completed", response["status"])
+	assert.Equal(t, float64(1), response["successful"], "expected 1 successful rebase for fork MR")
+	assert.Equal(t, float64(0), response["failed"])
+	assert.Len(t, mockClient.capturedRebaseMRs, 1)
+	assert.Equal(t, 100, mockClient.capturedRebaseMRs[0].mrIID)
+
+	// Verify fork path was used (CompareCommits in target project)
+	assert.Equal(t, 456, mockClient.capturedSourceProjectID, "fork path: source project ID should be fork (456)")
+	assert.Equal(t, 123, mockClient.capturedTargetProjectID, "fork path: target project ID should be upstream (123)")
+
+	// Verify rebase comment was added
+	assert.Len(t, mockClient.capturedComments, 1)
+	assert.Contains(t, mockClient.capturedComments[0], "Automated Rebase")
+}
+
+// TestAutoRebase_SameProjectMR tests auto-rebase with same-project MR (non-fork)
+func TestAutoRebase_SameProjectMR(t *testing.T) {
+	mockClient := &ForkMRCompareClient{
+		MockRebaseGitLabClient: &MockRebaseGitLabClient{
+			openMRs:           []int{200},
+			capturedRebaseMRs: make([]struct{ projectID, mrIID int }, 0),
+			capturedComments:  make([]string, 0),
+			sourceProjectID:   0, // Same-project MR
+		},
+		behindCount: 1,
+	}
+
+	cfg := &config.Config{
+		GitLab: config.GitLabConfig{
+			BaseURL: "https://gitlab.example.com",
+			Token:   "test-token",
+		},
+		AutoRebase: config.AutoRebaseConfig{
+			Enabled:               true,
+			CheckAtlantisComments: false,
+			RepositoryToken:       "test-token",
+		},
+		Comments: config.CommentsConfig{
+			EnableMRComments: true,
+		},
+	}
+
+	handler := NewAutoRebaseHandlerWithClient(cfg, mockClient)
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Post("/auto-rebase", handler.HandleWebhook)
+
+	payload := map[string]interface{}{
+		"object_kind": "push",
+		"ref":         "refs/heads/main",
+		"project": map[string]interface{}{
+			"id": 123,
+		},
+	}
+	jsonData, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/auto-rebase", bytes.NewReader(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 30000)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, 200, resp.StatusCode, "response body: %s", string(body))
+
+	var response map[string]interface{}
+	_ = json.Unmarshal(body, &response)
+
+	assert.Equal(t, "completed", response["status"])
+	assert.Equal(t, float64(1), response["successful"], "expected 1 successful rebase for same-project MR")
+	assert.Equal(t, float64(0), response["failed"])
+	assert.Len(t, mockClient.capturedRebaseMRs, 1)
+	assert.Equal(t, 200, mockClient.capturedRebaseMRs[0].mrIID)
+
+	// Verify CompareBranches was called with same project ID for both
+	assert.Equal(t, 123, mockClient.capturedSourceProjectID, "source project ID should match target for same-project MR")
+	assert.Equal(t, 123, mockClient.capturedTargetProjectID, "target project ID should be 123")
+
+	// Verify rebase comment was added
+	assert.Len(t, mockClient.capturedComments, 1)
+	assert.Contains(t, mockClient.capturedComments[0], "Automated Rebase")
+}
+
+// ForkMRCompareClient tracks project IDs for fork MR testing
+type ForkMRCompareClient struct {
+	*MockRebaseGitLabClient
+	capturedSourceProjectID int
+	capturedTargetProjectID int
+	behindCount             int
+}
+
+func (c *ForkMRCompareClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	c.capturedSourceProjectID = sourceProjectID
+	c.capturedTargetProjectID = targetProjectID
+	commits := make([]gitlab.CompareCommit, c.behindCount)
+	for i := 0; i < c.behindCount; i++ {
+		commits[i] = gitlab.CompareCommit{ID: "fork-commit-" + string(rune('a'+i)), ShortID: "fork", Title: "Fork commit"}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
+}
+
+// CompareCommits is used for fork MR path; record projectID as target (upstream)
+func (c *ForkMRCompareClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
+	c.capturedTargetProjectID = projectID
+	c.capturedSourceProjectID = 456 // Fork path: source is fork project (set by test)
+	commits := make([]gitlab.CompareCommit, c.behindCount)
+	for i := 0; i < c.behindCount; i++ {
+		commits[i] = gitlab.CompareCommit{ID: "fork-commit-" + string(rune('a'+i)), ShortID: "fork", Title: "Fork commit"}
 	}
 	return &gitlab.CompareResult{Commits: commits}, nil
 }

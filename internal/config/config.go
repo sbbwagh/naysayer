@@ -179,7 +179,7 @@ func Load() *Config {
 		},
 		AutoRebase: AutoRebaseConfig{
 			Enabled:               getEnv("AUTO_REBASE_ENABLED", "true") == "true",
-			CheckAtlantisComments: getEnv("AUTO_REBASE_CHECK_ATLANTIS_COMMENTS", "false") == "true",
+			CheckAtlantisComments: getEnv("AUTO_REBASE_CHECK_ATLANTIS_COMMENTS", "true") == "true",
 			// Support both new and old env var names for backward compatibility
 			RepositoryToken: getEnv("AUTO_REBASE_REPOSITORY_TOKEN", getEnv("GITLAB_TOKEN_FIVETRAN", "")),
 		},

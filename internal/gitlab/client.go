@@ -676,42 +676,83 @@ func (c *Client) RebaseMR(projectID, mrIID int) (bool, error) {
 	}
 }
 
-// CompareBranches compares two branches using GitLab Compare API
-// Returns the number of commits that targetBranch has that sourceBranch doesn't have
-// This is the AUTHORITATIVE way to determine if an MR needs rebasing
-// Direction: from=sourceBranch, to=targetBranch
-func (c *Client) CompareBranches(projectID int, sourceBranch, targetBranch string) (*CompareResult, error) {
-	// URL encode branch names to handle special characters
-	encodedSource := url.QueryEscape(sourceBranch)
-	encodedTarget := url.QueryEscape(targetBranch)
-
-	url := fmt.Sprintf("%s/api/v4/projects/%d/repository/compare?from=%s&to=%s",
-		strings.TrimRight(c.config.BaseURL, "/"), projectID, encodedSource, encodedTarget)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create compare branches request: %w", err)
+// CompareBranches compares two branches in the same project using GitLab Compare API.
+// Use only for same-project MRs. For fork MRs use CompareCommits with MR.Sha (see auto_rebase).
+// Direction: from=sourceBranch, to=targetBranch (commits in target that source doesn't have).
+func (c *Client) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*CompareResult, error) {
+	if sourceProjectID != targetProjectID {
+		return nil, fmt.Errorf("CompareBranches does not support cross-project: use CompareCommits with MR.Sha for fork MRs")
 	}
+	encodedFrom := url.QueryEscape(sourceBranch)
+	encodedTo := url.QueryEscape(targetBranch)
+	apiURL := fmt.Sprintf("%s/api/v4/projects/%d/repository/compare?from=%s&to=%s",
+		strings.TrimRight(c.config.BaseURL, "/"), targetProjectID, encodedFrom, encodedTo)
+	return c.doCompare(apiURL)
+}
 
+// GetBranchCommit returns the commit SHA of the branch HEAD.
+// GET /projects/:id/repository/branches/:branch
+func (c *Client) GetBranchCommit(projectID int, branch string) (string, error) {
+	encodedBranch := url.QueryEscape(branch)
+	apiURL := fmt.Sprintf("%s/api/v4/projects/%d/repository/branches/%s",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, encodedBranch)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create get branch request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to compare branches: %w", err)
+		return "", fmt.Errorf("failed to get branch: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("compare branches failed with status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("get branch failed with status %d: %s", resp.StatusCode, string(body))
 	}
+	var branchInfo struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&branchInfo); err != nil {
+		return "", fmt.Errorf("failed to decode branch response: %w", err)
+	}
+	return branchInfo.Commit.ID, nil
+}
 
+// CompareCommits compares two commits by SHA in one project.
+// Used for fork MRs: GitLab cannot compare across projects by branch; use MR.Sha (source HEAD) and target branch SHA.
+// GET /projects/:id/repository/compare?from=<source_sha>&to=<target_sha>
+func (c *Client) CompareCommits(projectID int, fromSHA, toSHA string) (*CompareResult, error) {
+	encodedFrom := url.QueryEscape(fromSHA)
+	encodedTo := url.QueryEscape(toSHA)
+	apiURL := fmt.Sprintf("%s/api/v4/projects/%d/repository/compare?from=%s&to=%s",
+		strings.TrimRight(c.config.BaseURL, "/"), projectID, encodedFrom, encodedTo)
+	return c.doCompare(apiURL)
+}
+
+func (c *Client) doCompare(apiURL string) (*CompareResult, error) {
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create compare request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compare: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("compare failed with status %d: %s", resp.StatusCode, string(body))
+	}
 	var result CompareResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode compare result: %w", err)
 	}
-
 	return &result, nil
 }
 

@@ -318,9 +318,9 @@ func TestE2E_AutoRebase(t *testing.T) {
 
 	cfg := createTestConfig(t)
 	cfg.AutoRebase = config.AutoRebaseConfig{
-		Enabled:              true,
+		Enabled:               true,
 		CheckAtlantisComments: false,
-		RepositoryToken:      "",
+		RepositoryToken:       "",
 	}
 
 	handler := webhook.NewAutoRebaseHandlerWithClient(cfg, mockGitLab)

@@ -14,24 +14,41 @@ GitLab MR fields like `behind_commits_count`, `diverged_commits_count`, `merge_s
 - Don't consistently reflect the true branch comparison state
 
 ### The Authoritative Method: Compare API
+
+**Same-project MRs** (source and target in the same project):
 ```bash
-# This is what Naysayer uses internally (and what GitLab UI uses)
 curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
   "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
   | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
 ```
 
-**How it works:**
-- `from=$SOURCE_BRANCH` - The MR source branch
-- `to=$TARGET_BRANCH` - The MR target branch (usually `main`)
-- `commits` array contains commits that target has but source doesn't
-- `behind_count = commits.length`
-- If `behind_count > 0` → Rebase needed
-- If `behind_count == 0` → Already up-to-date, skip rebase
+**Fork MRs** (GitLab REST API cannot compare across projects by branch; use SHAs in the **upstream** project):
+```bash
+# 1) Get fork branch SHA from the MR (source branch HEAD)
+FORK_SHA=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/merge_requests/$MR_IID" \
+  | jq -r '.sha')
 
-**Direction matters:**
-- ✅ Correct: `from=source&to=target` (commits target has that source needs)
-- ❌ Wrong: `from=target&to=source` (commits source has that target doesn't)
+# 2) Get target branch (e.g. main) SHA in upstream project
+MAIN_SHA=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/branches/$TARGET_BRANCH" \
+  | jq -r '.commit.id')
+
+# 3) Compare SHAs in the upstream project
+curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/compare?from=$FORK_SHA&to=$MAIN_SHA" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+```
+
+**How it works:**
+- Same-project: `from=source_branch`, `to=target_branch` in one project.
+- Fork MRs: GitLab does **not** support cross-project compare by branch (e.g. `from=project_id:branch` returns 404). Naysayer uses **SHA-based compare** in the upstream (target) project: MR `.sha` = source branch HEAD, then compare `from=<MR.sha>&to=<target_branch_sha>`.
+- `commits` = commits in target that source doesn’t have; `behind_count = commits.length`.
+- If `behind_count > 0` → Rebase needed; if `behind_count == 0` → Up-to-date, skip rebase.
+
+**Direction:** `from=source` (or source SHA), `to=target` (or target SHA).
+
+**Fork MR support:** Naysayer detects fork MRs (`source_project_id != target_project_id`), fetches MR `.sha` and target branch SHA, and calls compare in the upstream project.
 
 ## 📋 Overview
 

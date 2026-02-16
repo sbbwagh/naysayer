@@ -197,9 +197,9 @@ kubectl logs -f deployment/naysayer | grep -i "auto-rebase\|rebase"
 | `detailed_merge_status` | Can be null or inaccurate |
 
 **✅ GitLab Compare API is the AUTHORITATIVE source:**
-- `GET /projects/:id/repository/compare?from=<source>&to=<target>`
-- **Direction matters**: `from=source_branch`, `to=target_branch`
-- Returns commits that target has but source doesn't have
+- Same-project: `GET /projects/:id/repository/compare?from=<source_branch>&to=<target_branch>`
+- Fork MRs: GitLab cannot compare across projects by branch. Naysayer uses **SHA-based compare** in the upstream project: MR `.sha` (source branch HEAD) and target branch SHA, then `compare?from=<sha>&to=<target_sha>` in the target project.
+- **Direction**: `from=source`, `to=target` (commits in target that source doesn't have)
 - `commits` array length = number of commits behind
 - **This is what the GitLab UI uses** to show "X commits behind"
 
@@ -250,8 +250,9 @@ When `AUTO_REBASE_CHECK_ATLANTIS_COMMENTS=true`:
 1. **Webhook Trigger**: Push to `main`/`master` branch triggers webhook
 2. **MR Discovery**: System fetches all open MRs created in last 7 days
 3. **Pre-Rebase Checks**: For each MR:
-   - **Compare branches using GitLab Compare API** (authoritative check)
-     - Call: `GET /projects/:id/repository/compare?from=<source>&to=<target>`
+   - **Compare using GitLab Compare API** (authoritative check)
+     - **Same-project MRs**: `GET /projects/:id/repository/compare?from=<source_branch>&to=<target_branch>`
+     - **Fork MRs**: Get MR `.sha` (source HEAD) and target branch SHA; `GET /projects/:target_id/repository/compare?from=<mr.sha>&to=<target_branch_sha>` (GitLab cannot compare across projects by branch)
      - Parse `commits` array length to determine if behind
      - If `commits.length == 0` → Skip (already up-to-date)
      - If `commits.length > 0` → Continue to rebase
@@ -441,23 +442,22 @@ curl -H "Authorization: Bearer $AUTO_REBASE_REPOSITORY_TOKEN" \
 
 **Debug Commands**:
 ```bash
-# AUTHORITATIVE: Check if MR is behind using Compare API
-# This is the SAME method Naysayer uses - most reliable way to check
+# Same-project MR: compare by branch
 curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
   "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
   | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
 
-# Example output - MR needs rebase:
-# {
-#   "behind_count": 1,
-#   "behind_commits": ["db64c4c6ab5bdf3dc2bc214c1bf127cd80a80690"]
-# }
+# Fork MR: compare by SHA in upstream project (GitLab cannot compare across projects by branch)
+FORK_SHA=$(curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/merge_requests/$MR_IID" | jq -r '.sha')
+MAIN_SHA=$(curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/branches/main" | jq -r '.commit.id')
+curl -s -H "PRIVATE-TOKEN: $AUTO_REBASE_REPOSITORY_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/compare?from=$FORK_SHA&to=$MAIN_SHA" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
 
-# Example output - MR is up-to-date:
-# {
-#   "behind_count": 0,
-#   "behind_commits": []
-# }
+# Example output - MR needs rebase: {"behind_count": 1, "behind_commits": ["..."]}
+# Example output - up-to-date: {"behind_count": 0, "behind_commits": []}
 
 # Check MR details (less reliable, for reference only)
 curl -H "Authorization: Bearer $AUTO_REBASE_REPOSITORY_TOKEN" \

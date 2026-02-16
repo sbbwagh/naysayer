@@ -112,6 +112,7 @@ func (c *Client) GetMRTargetBranch(projectID, mrIID int) (string, error) {
 type MRDetails struct {
 	TargetBranch         string      `json:"target_branch"`
 	SourceBranch         string      `json:"source_branch"`
+	Sha                  string      `json:"sha"` // HEAD of source branch (used for fork MR compare)
 	IID                  int         `json:"iid"`
 	ProjectID            int         `json:"project_id"`             // Target project ID
 	SourceProjectID      int         `json:"source_project_id"`      // Source project ID (for cross-fork MRs)
@@ -139,13 +140,13 @@ type CompareResult struct {
 
 // CompareCommit represents a commit in a compare result
 type CompareCommit struct {
-	ID             string `json:"id"`
-	ShortID        string `json:"short_id"`
-	Title          string `json:"title"`
-	AuthorName     string `json:"author_name"`
-	AuthorEmail    string `json:"author_email"`
-	CommittedDate  string `json:"committed_date"`
-	Message        string `json:"message"`
+	ID            string `json:"id"`
+	ShortID       string `json:"short_id"`
+	Title         string `json:"title"`
+	AuthorName    string `json:"author_name"`
+	AuthorEmail   string `json:"author_email"`
+	CommittedDate string `json:"committed_date"`
+	Message       string `json:"message"`
 }
 
 // GetMRDetails fetches merge request details

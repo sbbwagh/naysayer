@@ -254,16 +254,16 @@ func (m *MockGitLabClient) GetMRTargetBranch(projectID, mrIID int) (string, erro
 func (m *MockGitLabClient) GetMRDetails(projectID, mrIID int) (*gitlab.MRDetails, error) {
 	createdAt := time.Now().Add(-24 * time.Hour).Format(time.RFC3339) // 1 day ago
 	return &gitlab.MRDetails{
-		IID:                mrIID,
-		SourceBranch:       m.sourceBranch,
-		TargetBranch:       m.targetBranch,
-		ProjectID:          projectID,
-		CreatedAt:          createdAt,
-		Pipeline:           &gitlab.MRPipeline{ID: 1, Status: "success"},
-		RebaseInProgress:   false,
-		HasConflicts:       false,
-		MergeStatus:        "can_be_merged",
-		BehindCommitsCount: 0,
+		IID:                  mrIID,
+		SourceBranch:         m.sourceBranch,
+		TargetBranch:         m.targetBranch,
+		ProjectID:            projectID,
+		CreatedAt:            createdAt,
+		Pipeline:             &gitlab.MRPipeline{ID: 1, Status: "success"},
+		RebaseInProgress:     false,
+		HasConflicts:         false,
+		MergeStatus:          "can_be_merged",
+		BehindCommitsCount:   0,
 		DivergedCommitsCount: 0,
 	}, nil
 }
@@ -319,9 +319,30 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
-// CompareBranches returns commits that target has but source doesn't (behind count).
-// For auto-rebase E2E, set AutoRebaseBehindCount >= 0 to return that many commits; otherwise returns 0 (up-to-date).
-func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+// CompareBranches returns commits that target has but source doesn't (same-project only in real API).
+func (m *MockGitLabClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	count := 0
+	if m.AutoRebaseBehindCount >= 0 {
+		count = m.AutoRebaseBehindCount
+	}
+	commits := make([]gitlab.CompareCommit, count)
+	for i := 0; i < count; i++ {
+		commits[i] = gitlab.CompareCommit{
+			ID:      fmt.Sprintf("e2e-commit-%d-%d", targetProjectID, i+1),
+			ShortID: "e2e",
+			Title:   "E2E test commit",
+		}
+	}
+	return &gitlab.CompareResult{Commits: commits}, nil
+}
+
+// GetBranchCommit returns a dummy SHA for E2E.
+func (m *MockGitLabClient) GetBranchCommit(projectID int, branch string) (string, error) {
+	return "e2e-main-sha", nil
+}
+
+// CompareCommits returns behind count for E2E (fork MR path).
+func (m *MockGitLabClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
 	count := 0
 	if m.AutoRebaseBehindCount >= 0 {
 		count = m.AutoRebaseBehindCount

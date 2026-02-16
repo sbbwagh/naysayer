@@ -159,15 +159,26 @@ curl -X POST https://your-naysayer-domain.com/auto-rebase \
 - Only push events to `main` or `master` branches trigger rebase operations
 
 **Behind Detection (Compare API)**:
+- Same-project MRs: compare by branch names in one project.
+- Fork MRs: GitLab cannot compare across projects by branch. Naysayer uses **SHA-based compare** in the upstream project: get MR `.sha` (source branch HEAD), get target branch SHA, then `compare?from=<MR.sha>&to=<target_sha>` in the upstream project.
+
 ```bash
-# AUTHORITATIVE method to check if MR is behind (same as GitLab UI)
+# Same-project: compare by branch
 curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
   "$GITLAB_BASE_URL/api/v4/projects/$PROJECT_ID/repository/compare?from=$SOURCE_BRANCH&to=$TARGET_BRANCH" \
   | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
+
+# Fork MR: get source SHA from MR, target SHA from branch, then compare in upstream project
+FORK_SHA=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/merge_requests/$MR_IID" | jq -r '.sha')
+MAIN_SHA=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/branches/main" | jq -r '.commit.id')
+curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  "$GITLAB_BASE_URL/api/v4/projects/$UPSTREAM_PROJECT_ID/repository/compare?from=$FORK_SHA&to=$MAIN_SHA" \
+  | jq '{behind_count: (.commits | length), behind_commits: [.commits[].id]}'
 ```
-- `behind_count > 0` → MR needs rebase
-- `behind_count == 0` → MR is up-to-date, skip rebase
-- Direction: `from=source`, `to=target` (commits in target that source doesn't have)
+- `behind_count > 0` → MR needs rebase; `behind_count == 0` → up-to-date, skip rebase
+- Direction: `from=source` (or source SHA), `to=target` (or target SHA)
 
 **Rebase Verification**:
 - After triggering a rebase, the system verifies that the rebase completed successfully:

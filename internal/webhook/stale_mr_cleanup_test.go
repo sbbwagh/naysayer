@@ -92,7 +92,13 @@ func (m *MockStaleMRClient) GetCurrentBotUsername() (string, error)           { 
 func (m *MockStaleMRClient) IsNaysayerBotAuthor(author map[string]interface{}) bool {
 	return false
 }
-func (m *MockStaleMRClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+func (m *MockStaleMRClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+func (m *MockStaleMRClient) GetBranchCommit(projectID int, branch string) (string, error) {
+	return "mock-sha", nil
+}
+func (m *MockStaleMRClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
 	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
 }
 func (m *MockStaleMRClient) RebaseMR(projectID, mrIID int) (bool, error) {

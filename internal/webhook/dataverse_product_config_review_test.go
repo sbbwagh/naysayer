@@ -503,7 +503,13 @@ func (m *MockGitLabClient) IsNaysayerBotAuthor(author map[string]interface{}) bo
 	return false
 }
 
-func (m *MockGitLabClient) CompareBranches(projectID int, sourceBranch, targetBranch string) (*gitlab.CompareResult, error) {
+func (m *MockGitLabClient) CompareBranches(sourceProjectID int, sourceBranch string, targetProjectID int, targetBranch string) (*gitlab.CompareResult, error) {
+	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
+}
+func (m *MockGitLabClient) GetBranchCommit(projectID int, branch string) (string, error) {
+	return "mock-sha", nil
+}
+func (m *MockGitLabClient) CompareCommits(projectID int, fromSHA, toSHA string) (*gitlab.CompareResult, error) {
 	return &gitlab.CompareResult{Commits: []gitlab.CompareCommit{}}, nil
 }
 
